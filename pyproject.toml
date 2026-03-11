@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capstone-chatbot"
+version = "0.1.0"
+description = "Conversational research data dictionary assistant"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "streamlit>=1.44.0",
+  "pandas>=2.2.0",
+  "openpyxl>=3.1.0",
+  "scikit-learn>=1.5.0",
+  "numpy>=1.26.0",
+  "python-dotenv>=1.0.1",
+  "openai>=1.68.0"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

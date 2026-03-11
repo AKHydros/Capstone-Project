@@ -1,0 +1,29 @@
+{
+  "signature": "AI Chatbot for Research Data Dictionary_Draft Project Plan (2.1).docx:74281:1773187967496746128|PMB16_ROB.docx:44602:1773204000000000000|PMG17_GAM.docx:76423:1773204000000000000|PMG17_WAI.docx:77886:1773204000000000000|PMG18_ROB.docx:52094:1773204000000000000|PMG19_GAM.docx:144896:1773204000000000000|PMG19_WAI.docx:219741:1773204000000000000|PMG20_GAM.docx:66498:1773204000000000000|PMG20_SBO.docx:1054015:1773204000000000000|PMG22_WAI.docx:1408172:1773204000000000000",
+  "prompts": [
+    "To begin, are you or anyone in your household, currently or formerly employed in any of the following?",
+    "Are you (or another member of your household) responsible for any of the following within a bank, insurance company, brokerage, financial planning or financial company?",
+    "Thinking of various financial activities available on the internet, which of the following do you currently do, or might be interested in doing in the next year or two?",
+    "Which of the following do you use for your savings and investments? [Check all that apply]",
+    "Thinking of your savings and investments, how likely would you be to interact with your financial institution in the following ways?",
+    "Generally speaking, how interested would you be in having access to more digital material, tools and/or applications to help you with your finances?",
+    "Before today, have you ever heard of the term robo-advisor?",
+    "Are you currently using a robo-advisor service for some or all of your investments?",
+    "How likely or unlikely would you be to consider using a robo-advisor service in the next year or two?",
+    "How much of your savings and investments are you managing or would you consider managing with a robo-advisor service?",
+    "Whether or not you currently use a robo-advisor service, how much do you agree or disagree with the following as reasons why you WOULD use a robo-advisor service?",
+    "How much of a concern, if any, would each of the following be to you using a robo-advisor service?",
+    "Which of the following service features, if any, would you find most useful in a robo-advisor service? [Check all that apply]",
+    "Which of the following technical features, if any, were important in considering or would be important for you to consider using a robo-advisor service? [Check all that apply]",
+    "Thinking of your own finances, how much would you think a reasonable monthly fee would be to use a robo-advisor service that offered all the features that you considered important?",
+    "Based on what you know today, generally speaking what would be your view of robo-advisor services?",
+    "When you hear the word \"risk\" as it relates to your finances, do you\u2026?",
+    "In terms of your risk tolerance as it relates to investing, how would you categorize yourself?",
+    "Do you currently have a financial advisor that you use to help you with your financial investments?",
+    "Overall, how satisfied or dissatisfied are you with your current financial advisor? If you have more than one, consider your main financial advisor.",
+    "Which of the following statements best describes how your financial decisions are made?",
+    "[IF USES ROBO-ADVISOR IN Q.8] What impact, if any, has using a robo-advisor service had on your relationship with your financial advisor?",
+    "[IF LIKELY TO USE ROBO-ADVISOR IN Q.9] If you were to use a robo-advisor service, what impact, if any, would this have on your relationship with your financial advisor?",
+    "In what year were you born?"
+  ]
+}

@@ -1,0 +1,52 @@
+Metadata-Version: 2.4
+Name: capstone-chatbot
+Version: 0.1.0
+Summary: Conversational research data dictionary assistant
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: streamlit>=1.44.0
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: openpyxl>=3.1.0
+Requires-Dist: scikit-learn>=1.5.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: openai>=1.68.0
+
+# Capstone Research Chatbot
+
+Backend-first E2E conversational assistant for PMG research dictionaries.
+
+## Scope assumptions implemented
+- Single source of truth is one Excel file.
+- Chatbot interface is the product interface (Streamlit).
+- Business rules are isolated in `src/backend/business_rules.py`.
+
+## Repository structure
+- `src/backend/config.py`: environment and file path config.
+- `src/backend/business_rules.py`: ranking weights, filtering rules, grounding rules.
+- `src/backend/models.py`: core data models.
+- `src/backend/loaders/excel_repository.py`: Excel parser and normalization.
+- `src/backend/retrieval/`: lexical, semantic, and hybrid retrieval.
+- `src/backend/services/chatbot_service.py`: orchestrates retrieval + response generation.
+- `src/backend/llm/openai_client.py`: optional OpenAI summarization layer.
+- `src/ui/app.py`: Streamlit chatbot interface.
+
+## Setup
+```bash
+cd /Users/alexkatzighera/Documents/Capstone\ Project
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+cp .env.example .env
+```
+
+## Run
+```bash
+cd /Users/alexkatzighera/Documents/Capstone\ Project
+source .venv/bin/activate
+PYTHONPATH=src streamlit run src/ui/app.py
+```
+
+## Notes
+- If `OPENAI_API_KEY` is not set, semantic retrieval falls back to a local embedding approximation and chat summaries are deterministic.
+- When API key is set, OpenAI embeddings and chat summarization are used.
