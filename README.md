@@ -22,7 +22,7 @@ Backend-first E2E conversational assistant for PMG research dictionaries.
 
 ## Setup
 ```bash
-cd /Users/alexkatzighera/Documents/Capstone\ Project
+cd .
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -31,7 +31,7 @@ cp .env.example .env
 
 ## Run
 ```bash
-cd /Users/alexkatzighera/Documents/Capstone\ Project
+cd .
 source .venv/bin/activate
 PYTHONPATH=src streamlit run src/ui/app.py
 ```

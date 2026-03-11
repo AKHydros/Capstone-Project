@@ -19,10 +19,10 @@ class AppConfig:
 def load_config() -> AppConfig:
     source = os.getenv(
         "EXCEL_SOURCE_PATH",
-        "/Users/alexkatzighera/Desktop/Queens MMAI/Capstone/market_research_capstone_draft_1.xlsx",
+        "data/market_research_capstone_draft_1.xlsx",
     )
     cache_dir = os.getenv(
         "INDEX_CACHE_DIR",
-        "/Users/alexkatzighera/Documents/Capstone Project/data/cache",
+        "data/cache",
     )
     return AppConfig(excel_source_path=Path(source), index_cache_dir=Path(cache_dir))
