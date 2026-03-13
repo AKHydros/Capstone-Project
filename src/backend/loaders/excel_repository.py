@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from ..business_rules import infer_survey_name, infer_wave_year, is_valid_question_text
+from ..business_rules import (
+    categorize_question_labels,
+    infer_survey_name,
+    infer_wave_year,
+    is_valid_question_text,
+)
 from ..models import QuestionRecord
 
 
@@ -60,6 +65,8 @@ class ExcelRepository:
                 if variable in seen_question_ids:
                     continue
                 seen_question_ids.add(variable)
+                value_labels = value_map.get(variable, [])
+                topic_labels, topic_label_sources = categorize_question_labels(label, value_labels)
 
                 records.append(
                     QuestionRecord(
@@ -70,7 +77,9 @@ class ExcelRepository:
                         source_file=str(source_path),
                         survey_name=infer_survey_name(variable),
                         wave_year=infer_wave_year(variable),
-                        value_labels=value_map.get(variable, []),
+                        value_labels=value_labels,
+                        topic_labels=topic_labels,
+                        topic_label_sources=topic_label_sources,
                     )
                 )
         if not records:

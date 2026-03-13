@@ -11,6 +11,7 @@ Backend-first E2E conversational assistant for PMG research dictionaries.
 - `src/backend/config.py`: environment and file path config.
 - `src/backend/cache/index_cache.py`: persistent cache for built retrieval index.
 - `src/backend/business_rules.py`: ranking weights, filtering rules, grounding rules.
+- `src/backend/business_rules.py`: ranking weights, filtering rules, grounding rules, and topic categorization.
 - `src/backend/models.py`: core data models.
 - `src/backend/loaders/excel_repository.py`: Excel parser and normalization.
 - `src/backend/loaders/survey_prompt_loader.py`: extracts starter prompts from sample survey `.docx` files.
@@ -47,3 +48,5 @@ PYTHONPATH=src streamlit run src/ui/app.py
 - UI supports uploading additional `.xlsx` and `.docx` files into `data/user_uploads/`.
   - Uploaded `.xlsx` files are included in backend ingestion on next rebuild.
   - Uploaded `.docx` files are included in starter-prompt extraction.
+- Questions are auto-labeled into topic categories (for example: Demographics, Financial Planning, Trust & Sentiment, Digital Behavior).
+- UI includes `Label Type` filtering to show where labels came from (`Question Text`, `Value Labels`, `Both`, or `Fallback`).

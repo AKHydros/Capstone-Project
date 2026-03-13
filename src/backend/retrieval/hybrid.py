@@ -27,6 +27,8 @@ class HybridRetriever:
         query: str,
         survey_name: str | None = None,
         wave_year: str | None = None,
+        topic_label: str | None = None,
+        topic_source_type: str | None = None,
         top_k: int | None = None,
     ) -> list[QuestionRecord]:
         top_k = top_k or RETRIEVAL_RULES.top_k
@@ -44,7 +46,13 @@ class HybridRetriever:
             if score >= RETRIEVAL_RULES.min_score_threshold:
                 scored.append((score, record))
 
-        filtered_records = apply_filters((r for _, r in scored), survey_name=survey_name, wave_year=wave_year)
+        filtered_records = apply_filters(
+            (r for _, r in scored),
+            survey_name=survey_name,
+            wave_year=wave_year,
+            topic_label=topic_label,
+            topic_source_type=topic_source_type,
+        )
         score_map = {r.question_id: s for s, r in scored}
         ranked = sorted(filtered_records, key=lambda r: score_map.get(r.question_id, 0.0), reverse=True)
         return ranked[:top_k]

@@ -100,6 +100,8 @@ with st.sidebar:
     st.subheader("Filters")
     survey_filter = st.selectbox("Survey", options=["All"] + artifacts.surveys, index=0)
     wave_filter = st.selectbox("Wave/Year", options=["All"] + artifacts.waves, index=0)
+    topic_filter = st.selectbox("Topic Label", options=["All"] + artifacts.topics, index=0)
+    label_type_filter = st.selectbox("Label Type", options=["All"] + artifacts.topic_source_types, index=0)
 
     st.subheader("Starter Questions")
     for idx, prompt in enumerate(artifacts.starter_prompts[:8], start=1):
@@ -126,7 +128,15 @@ if prompt:
     with st.chat_message("assistant"):
         survey_name = None if survey_filter == "All" else survey_filter
         wave_year = None if wave_filter == "All" else wave_filter
-        response = artifacts.chatbot_service.chat(prompt, survey_name=survey_name, wave_year=wave_year)
+        topic_label = None if topic_filter == "All" else topic_filter
+        topic_source_type = None if label_type_filter == "All" else label_type_filter
+        response = artifacts.chatbot_service.chat(
+            prompt,
+            survey_name=survey_name,
+            wave_year=wave_year,
+            topic_label=topic_label,
+            topic_source_type=topic_source_type,
+        )
 
         st.markdown(response.answer)
         if response.ranked_results:
@@ -137,6 +147,11 @@ if prompt:
                     st.write(f"**Question Text:** {record.question_text}")
                     st.write(f"**Survey:** {record.survey_name}")
                     st.write(f"**Wave/Year:** {record.wave_year}")
+                    st.write(f"**Topic Labels:** {record.topic_labels_text}")
+                    st.write("**Label Sources:**")
+                    for topic in record.topic_labels:
+                        source = record.topic_label_sources.get(topic, "Unknown")
+                        st.write(f"- {topic}: {source}")
                     st.write(f"**Measurement Level:** {record.measurement_level}")
                     st.write(f"**Source File:** {record.source_file}")
                     if record.value_labels:

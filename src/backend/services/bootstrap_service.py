@@ -19,6 +19,8 @@ class BootstrapArtifacts:
     chatbot_service: ChatbotService
     surveys: list[str]
     waves: list[str]
+    topics: list[str]
+    topic_source_types: list[str]
     cache_status: CacheInspectResult
     cache_status_at_startup: str
     cache_rebuilt: bool
@@ -76,12 +78,16 @@ class BootstrapService:
         service = ChatbotService(retriever=retriever, llm_client=OpenAIChatClient())
         surveys = sorted({r.survey_name for r in records if r.survey_name})
         waves = sorted({r.wave_year for r in records if r.wave_year})
+        topics = sorted({topic for r in records for topic in r.topic_labels})
+        topic_source_types = sorted({source for r in records for source in r.topic_label_sources.values()})
         cache_status = cache.inspect(signature)
 
         return BootstrapArtifacts(
             chatbot_service=service,
             surveys=surveys,
             waves=waves,
+            topics=topics,
+            topic_source_types=topic_source_types,
             cache_status=cache_status,
             cache_status_at_startup=startup_cache_status.state,
             cache_rebuilt=rebuilt,

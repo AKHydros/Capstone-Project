@@ -18,8 +18,16 @@ class ChatbotService:
         query: str,
         survey_name: str | None = None,
         wave_year: str | None = None,
+        topic_label: str | None = None,
+        topic_source_type: str | None = None,
     ) -> ChatResponse:
-        ranked = self.retriever.search(query=query, survey_name=survey_name, wave_year=wave_year)
+        ranked = self.retriever.search(
+            query=query,
+            survey_name=survey_name,
+            wave_year=wave_year,
+            topic_label=topic_label,
+            topic_source_type=topic_source_type,
+        )
         cards = ranked[: CHAT_RULES.max_cards_display]
 
         if not cards:
