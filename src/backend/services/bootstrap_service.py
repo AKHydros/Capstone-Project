@@ -7,16 +7,25 @@ from pathlib import Path
 from ..business_rules import RETRIEVAL_RULES
 from ..cache.index_cache import CacheInspectResult, IndexCache, build_signature
 from ..config import AppConfig
+from ..observability import JsonEventLogger, ObservabilityStore
 from ..llm.openai_client import OpenAIChatClient
 from ..loaders.excel_repository import ExcelRepository
 from ..loaders.survey_prompt_loader import SurveyPromptLoader
 from ..retrieval.hybrid import HybridRetriever
+from .agent_router_service import AgentRouterService
 from .chatbot_service import ChatbotService
+from .governance_service import GovernanceService
+from .llm_health_service import LlmHealthService
+from .question_library_service import QuestionLibraryService
+from .safety_service import SafetyService
+from .translation_service import TranslationService
 
 
 @dataclass(frozen=True)
 class BootstrapArtifacts:
     chatbot_service: ChatbotService
+    agent_router_service: AgentRouterService
+    observability_store: ObservabilityStore
     surveys: list[str]
     waves: list[str]
     topics: list[str]
@@ -25,6 +34,8 @@ class BootstrapArtifacts:
     cache_status_at_startup: str
     cache_rebuilt: bool
     starter_prompts: list[str]
+    top_questions: list[str]
+    generated_questions: list[str]
 
 
 class BootstrapService:
@@ -75,7 +86,26 @@ class BootstrapService:
             prompt_loader.clear_cache()
         starter_prompts = prompt_loader.load_prompts(max_prompts=24, force_refresh=force_refresh_prompts)
 
+        observability_store = ObservabilityStore(self.config.observability_db_path)
+        event_logger = JsonEventLogger(self.config.logs_dir)
+        llm_health_service = LlmHealthService()
+        translation_service = TranslationService()
+        safety_service = SafetyService()
+        governance_service = GovernanceService(observability_store)
+        question_library_service = QuestionLibraryService(governance_service)
+
         service = ChatbotService(retriever=retriever, llm_client=OpenAIChatClient())
+        question_library = question_library_service.preload(records, iterations=10)
+        agent_router_service = AgentRouterService(
+            chatbot_service=service,
+            store=observability_store,
+            logger=event_logger,
+            governance_service=governance_service,
+            translation_service=translation_service,
+            safety_service=safety_service,
+            llm_health_service=llm_health_service,
+            default_mode=self.config.default_router_mode,
+        )
         surveys = sorted({r.survey_name for r in records if r.survey_name})
         waves = sorted({r.wave_year for r in records if r.wave_year})
         topics = sorted({topic for r in records for topic in r.topic_labels})
@@ -84,6 +114,8 @@ class BootstrapService:
 
         return BootstrapArtifacts(
             chatbot_service=service,
+            agent_router_service=agent_router_service,
+            observability_store=observability_store,
             surveys=surveys,
             waves=waves,
             topics=topics,
@@ -92,6 +124,8 @@ class BootstrapService:
             cache_status_at_startup=startup_cache_status.state,
             cache_rebuilt=rebuilt,
             starter_prompts=starter_prompts,
+            top_questions=question_library.top_questions,
+            generated_questions=question_library.generated_questions,
         )
 
 

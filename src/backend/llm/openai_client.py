@@ -15,16 +15,31 @@ class OpenAIChatClient:
     def enabled(self) -> bool:
         return self.client is not None
 
-    def summarize(self, system_prompt: str, user_prompt: str) -> str:
+    def summarize(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        model: str | None = None,
+        max_output_tokens: int | None = None,
+        top_p: float | None = None,
+        temperature: float | None = None,
+    ) -> str:
         if not self.client:
             raise RuntimeError("OpenAI client is not configured")
 
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
+        request_payload: dict[str, object] = {
+            "model": model or self.model,
+            "input": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.1,
-        )
+            "temperature": 0.1 if temperature is None else temperature,
+        }
+        if max_output_tokens is not None:
+            request_payload["max_output_tokens"] = max_output_tokens
+        if top_p is not None:
+            request_payload["top_p"] = top_p
+
+        response = self.client.responses.create(**request_payload)
         return response.output_text
