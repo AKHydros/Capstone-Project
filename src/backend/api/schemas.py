@@ -46,6 +46,9 @@ class AgentRouterResponse(BaseModel):
     response: str
     language_out: str
     fallback_used: bool
+    retrieval_mode: str
+    confidence_score: float | None = None
+    cache_status: dict[str, bool]
     labels: list[str]
     takeaways: list[str]
     latency_ms: float
@@ -75,3 +78,25 @@ class LlmHealthResponse(BaseModel):
     status: str
     last_check_time: str
     error_summary: str | None
+
+
+class ReindexRequest(BaseModel):
+    refresh_prompts: bool = False
+
+
+class IndexHealthResponse(BaseModel):
+    index_version: str
+    signature: str
+    document_count: int
+    chunk_count: int
+    last_rebuild_epoch: int | None = None
+    embedding_mode: str
+    cache_status_at_startup: str
+    cache_status_current: str
+    cache_hit_rates: dict[str, float]
+    cache_counters: dict[str, int]
+
+
+class ReindexResponse(BaseModel):
+    ok: bool
+    index_health: IndexHealthResponse

@@ -49,3 +49,9 @@ class QuestionRecord:
 class ChatResponse:
     answer: str
     ranked_results: list[QuestionRecord]
+    lookup_mode: str = "hybrid_fallback"
+    variant_count: int = 0
+    retrieval_mode: str = "deterministic"
+    confidence_score: float | None = None
+    embedding_cache_hit: bool = False
+    answer_cache_hit: bool = False

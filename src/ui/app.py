@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from functools import lru_cache
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -66,8 +67,8 @@ def _init_state() -> None:
         st.session_state.inference_temperature = 0.1
     if "show_admin_dashboard" not in st.session_state:
         st.session_state.show_admin_dashboard = False
-    if "consent_toggle_top" not in st.session_state:
-        st.session_state.consent_toggle_top = st.session_state.consent_granted
+    if "session_consent_applied" not in st.session_state:
+        st.session_state.session_consent_applied = False
 
 
 def _save_uploaded_files(uploads_dir: Path, uploaded_files: list[object] | None) -> int:
@@ -101,17 +102,20 @@ def _request_cache_action(*, rebuild: bool, refresh_prompts: bool, toast_message
     st.rerun()
 
 
-def _save_consent_choice(client: ApiClient, granted: bool) -> None:
-    result = client.consent_record(
-        session_id=st.session_state.session_id,
-        user_consent=granted,
-        locale=st.session_state.language,
-    )
-    st.session_state.consent_granted = granted
-    st.session_state.consent_toggle_top = granted
-    level = result.get("effective_logging_level", "minimal")
-    st.session_state.pending_toast = f"Consent saved. Logging level: {level}."
-    st.rerun()
+def _ensure_chat_session_enabled(client: ApiClient) -> None:
+    if st.session_state.session_consent_applied:
+        return
+    try:
+        client.consent_record(
+            session_id=st.session_state.session_id,
+            user_consent=True,
+            locale=st.session_state.language,
+        )
+        st.session_state.consent_granted = True
+        st.session_state.session_consent_applied = True
+    except Exception:  # noqa: BLE001
+        # Best effort. If this fails, the router may still enforce consent.
+        st.session_state.pending_toast = "Could not auto-enable chat session consent."
 
 
 def _combine_starter_prompts(starter_prompts: list[str], top_questions: list[str]) -> list[str]:
@@ -128,6 +132,17 @@ def _combine_starter_prompts(starter_prompts: list[str], top_questions: list[str
     return combined
 
 
+def _chat_history_text(history: list[dict[str, str]]) -> str:
+    lines: list[str] = []
+    for msg in history:
+        role = msg.get("role", "unknown").upper()
+        content = msg.get("content", "").strip()
+        if not content:
+            continue
+        lines.append(f"{role}: {content}")
+    return "\n\n".join(lines) if lines else "No chat messages yet."
+
+
 def _render_admin_dashboard(client: ApiClient) -> None:
     st.markdown("### Admin & Monitoring Dashboard")
 
@@ -141,6 +156,33 @@ def _render_admin_dashboard(client: ApiClient) -> None:
         st.metric("Consent Enforced", "Yes" if compliance.get("consent_enforced") else "No")
     with c3:
         st.metric("Policy Version", compliance.get("safety_policy_version", "v1"))
+
+    st.markdown("#### RAG Index Health")
+    index_health = client.index_health()
+    i1, i2, i3, i4 = st.columns(4)
+    with i1:
+        st.metric("Index Version", index_health.get("index_version", "N/A"))
+    with i2:
+        st.metric("Documents", int(index_health.get("document_count", 0)))
+    with i3:
+        st.metric("Chunks", int(index_health.get("chunk_count", 0)))
+    with i4:
+        st.metric("Embedding Mode", index_health.get("embedding_mode", "unknown"))
+    st.caption(
+        "Cache hit rates | "
+        f"embedding: {index_health.get('cache_hit_rates', {}).get('embedding', 0.0):.2%}, "
+        f"answer: {index_health.get('cache_hit_rates', {}).get('answer', 0.0):.2%}, "
+        f"router: {index_health.get('cache_hit_rates', {}).get('router', 0.0):.2%}"
+    )
+    if st.button("Force Reindex", key="admin_force_reindex"):
+        result = client.rebuild_index(refresh_prompts=False)
+        health = result.get("index_health", {})
+        st.success(
+            "Reindex completed. "
+            f"Version {health.get('index_version', 'N/A')} | "
+            f"Chunks {health.get('chunk_count', 0)}"
+        )
+        st.rerun()
 
     st.markdown("#### SLA Metrics")
     sla = client.metrics_sla()
@@ -222,6 +264,7 @@ except Exception as exc:  # noqa: BLE001
     st.stop()
 
 client = ApiClient(config=config, artifacts=artifacts)
+_ensure_chat_session_enabled(client)
 
 if st.session_state.pending_toast:
     st.toast(st.session_state.pending_toast)
@@ -230,8 +273,10 @@ if st.session_state.pending_toast:
 cache_startup, cache_current, cache_action, cache_built = _cache_status_text(artifacts)
 llm_health = client.llm_health()
 llm_status = llm_health.get("status", "Unknown")
+deployment_mode = "Remote API" if client.using_remote_api else "In-process API adapter"
+llm_badge = "🟢 Connected" if str(llm_status).lower() == "connected" else "🔴 Disconnected"
 
-header_logo_col, header_title_col, header_menu_col = st.columns([1.2, 5.0, 0.8])
+header_logo_col, header_menu_col, header_title_col, header_dashboard_col = st.columns([1.1, 1.2, 4.5, 1.4])
 with header_logo_col:
     logo_path = Path(__file__).parent / "assets" / "pmg_logo.png"
     if logo_path.exists():
@@ -239,12 +284,38 @@ with header_logo_col:
     else:
         st.markdown("### PMG")
 
-with header_title_col:
-    st.title("Research Data Dictionary Chatbot")
-    st.caption("Single source of truth for variables, labels, mappings, and trends")
-
 with header_menu_col:
-    with st.popover("..."):
+    with st.popover("Chat & System"):
+        export_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        st.markdown("#### Chat Export")
+        st.download_button(
+            "Export Chat (.txt)",
+            data=_chat_history_text(st.session_state.chat_history),
+            file_name=f"chat_export_{export_ts}.txt",
+            mime="text/plain",
+            use_container_width=True,
+            key="export_chat_txt",
+        )
+        st.download_button(
+            "Export Chat (.json)",
+            data=json.dumps(st.session_state.chat_history, indent=2),
+            file_name=f"chat_export_{export_ts}.json",
+            mime="application/json",
+            use_container_width=True,
+            key="export_chat_json",
+        )
+        st.markdown("#### LLM Health")
+        st.write(llm_badge)
+        if llm_health.get("last_check_time"):
+            st.caption(f"Checked: {llm_health.get('last_check_time')}")
+
+        st.markdown("#### Client Mode")
+        st.write(f"**{deployment_mode}**")
+        if client.using_remote_api:
+            st.caption("Remote API means this UI calls your FastAPI backend over HTTP using API_BASE_URL.")
+        else:
+            st.caption("In-process adapter means this UI runs backend logic locally without HTTP calls.")
+
         st.markdown("#### Cache Controls")
         st.caption(f"Startup: {cache_startup} | Current: {cache_current} | Action: {cache_action}")
         st.caption(f"Last Build: {cache_built}")
@@ -261,30 +332,11 @@ with header_menu_col:
                 toast_message="Starter prompts refresh requested.",
             )
 
-tile_consent, tile_llm, tile_client, tile_admin = st.columns(4, gap="small")
+with header_title_col:
+    st.title("Research Data Dictionary Chatbot")
+    st.caption("Single source of truth for variables, labels, mappings, and trends")
 
-with tile_consent:
-    with st.container(border=True):
-        st.markdown("###### Consent")
-        st.toggle("Allow telemetry", key="consent_toggle_top")
-        if st.session_state.consent_toggle_top != st.session_state.consent_granted:
-            _save_consent_choice(client, st.session_state.consent_toggle_top)
-        st.caption("Allowed" if st.session_state.consent_granted else "Not Yet")
-
-with tile_llm:
-    with st.container(border=True):
-        st.markdown("###### LLM Health")
-        st.write(f"**{llm_status}**")
-        if llm_health.get("last_check_time"):
-            st.caption(f"Checked: {llm_health.get('last_check_time')}")
-
-with tile_client:
-    with st.container(border=True):
-        st.markdown("###### Client Mode")
-        deployment_mode = "Remote API" if client.using_remote_api else "In-process API adapter"
-        st.write(f"**{deployment_mode}**")
-
-with tile_admin:
+with header_dashboard_col:
     with st.container(border=True):
         st.markdown("###### Dashboard")
         st.toggle("Admin & Monitoring", key="show_admin_dashboard")
@@ -435,9 +487,6 @@ with st.sidebar:
 if st.session_state.show_admin_dashboard:
     _render_admin_dashboard(client)
 else:
-    if not st.session_state.consent_granted:
-        st.warning("Consent is required before query content is processed.")
-
     library = client.question_library()
     top_questions = library.get("top_questions", [])
     starter_prompt_pool = _combine_starter_prompts(artifacts.starter_prompts, top_questions)

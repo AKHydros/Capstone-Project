@@ -9,13 +9,17 @@ import time
 from ..retrieval.hybrid import HybridRetriever
 
 
-CACHE_SCHEMA_VERSION = "v3"
+CACHE_SCHEMA_VERSION = "v4"
 
 
 @dataclass(frozen=True)
 class CacheMetadata:
+    index_version: str
     signature: str
     created_at_epoch: int
+    document_count: int
+    chunk_count: int
+    embedding_mode: str
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,11 @@ class CacheInspectResult:
     matched_signature: bool
     cache_file: Path
     created_at_epoch: int | None
+    signature: str | None
+    index_version: str | None
+    document_count: int
+    chunk_count: int
+    embedding_mode: str
 
 
 class IndexCache:
@@ -54,18 +63,36 @@ class IndexCache:
                 matched_signature=False,
                 cache_file=self.cache_file,
                 created_at_epoch=None,
+                signature=None,
+                index_version=None,
+                document_count=0,
+                chunk_count=0,
+                embedding_mode="unknown",
             )
         matched = bundle.metadata.signature == signature
         return CacheInspectResult(
-            state="updated" if matched else "latent",
+            state="updated" if matched else "stale",
             matched_signature=matched,
             cache_file=self.cache_file,
             created_at_epoch=bundle.metadata.created_at_epoch,
+            signature=bundle.metadata.signature,
+            index_version=bundle.metadata.index_version,
+            document_count=bundle.metadata.document_count,
+            chunk_count=bundle.metadata.chunk_count,
+            embedding_mode=bundle.metadata.embedding_mode,
         )
 
     def save(self, signature: str, retriever: HybridRetriever) -> None:
+        embedding_mode = retriever.semantic.mode if hasattr(retriever, "semantic") else "unknown"
         bundle = CacheBundle(
-            metadata=CacheMetadata(signature=signature, created_at_epoch=int(time.time())),
+            metadata=CacheMetadata(
+                index_version=CACHE_SCHEMA_VERSION,
+                signature=signature,
+                created_at_epoch=int(time.time()),
+                document_count=len(retriever.records),
+                chunk_count=len(getattr(retriever, "chunks", [])),
+                embedding_mode=embedding_mode,
+            ),
             retriever=retriever,
         )
         with self.cache_file.open("wb") as handle:
@@ -84,6 +111,9 @@ class IndexCache:
         except Exception:
             return None
         if not isinstance(bundle, CacheBundle):
+            return None
+        metadata = bundle.metadata
+        if not isinstance(metadata, CacheMetadata):
             return None
         return bundle
 

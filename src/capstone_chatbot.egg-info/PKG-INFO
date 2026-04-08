@@ -5,6 +5,9 @@ Summary: Conversational research data dictionary assistant
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 Requires-Dist: streamlit>=1.44.0
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: uvicorn>=0.32.0
+Requires-Dist: httpx>=0.28.0
 Requires-Dist: pandas>=2.2.0
 Requires-Dist: openpyxl>=3.1.0
 Requires-Dist: scikit-learn>=1.5.0
@@ -12,41 +15,458 @@ Requires-Dist: numpy>=1.26.0
 Requires-Dist: python-dotenv>=1.0.1
 Requires-Dist: openai>=1.68.0
 
-# Capstone Research Chatbot
+# PMG Intelligence Capstone Chatbot
 
-Backend-first E2E conversational assistant for PMG research dictionaries.
+Research-first conversational assistant for PMG data dictionaries with grounded retrieval, hybrid routing, and operational observability/governance controls.
 
-## Scope assumptions implemented
-- Single source of truth is one Excel file.
-- Chatbot interface is the product interface (Streamlit).
-- Business rules are isolated in `src/backend/business_rules.py`.
+---
 
-## Repository structure
-- `src/backend/config.py`: environment and file path config.
-- `src/backend/business_rules.py`: ranking weights, filtering rules, grounding rules.
-- `src/backend/models.py`: core data models.
-- `src/backend/loaders/excel_repository.py`: Excel parser and normalization.
-- `src/backend/retrieval/`: lexical, semantic, and hybrid retrieval.
-- `src/backend/services/chatbot_service.py`: orchestrates retrieval + response generation.
-- `src/backend/llm/openai_client.py`: optional OpenAI summarization layer.
-- `src/ui/app.py`: Streamlit chatbot interface.
+## Executive Snapshot
 
-## Setup
+| Area | Current state |
+|---|---|
+| Journey scope | Consent -> query -> grounded retrieval -> routed response -> governance/trace logging |
+| Architecture | Streamlit UI + FastAPI service + in-process adapter fallback |
+| Runtime | Python (`streamlit`, `fastapi`, `uvicorn`) |
+| Observability | SQLite telemetry, JSONL events, trace IDs, SLA snapshots |
+| Test status (Mar 31, 2026) | No automated test suite committed in this repo |
+
+---
+
+## Why This Exists
+
+Research dictionary workflows become slow when users need to manually scan large spreadsheets, reconcile survey waves, and validate topic mappings without clear traceability.
+This project reduces that friction by combining deterministic retrieval and filtering with optional LLM summarization, then wrapping the flow with consent controls, governance labeling, and auditable telemetry.
+
+Primary users:
+- **Research teams:** quickly locate grounded variables/labels across surveys and waves.
+- **Product owners:** operate a usable chatbot interface with controlled routing modes (`hybrid`, `llm`, `deterministic`).
+- **Governance/operations stakeholders:** monitor compliance posture, trace-level outcomes, and SLA metrics.
+
+---
+
+## Project Documents
+
+- Current implementation overview: this README.
+- Data inputs: `data/market_research_capstone_draft_1.xlsx` plus optional uploads in `data/user_uploads/`.
+- Prompt seed inputs: `.docx` files under `data/` (cached to `data/cache/starter_prompts.json`).
+
+---
+
+## Product Demo Assets
+
+Recommended capture set for presentation/demo updates:
+- Consent capture and logging level confirmation
+- Route mode switching (`hybrid` / `llm` / `deterministic`)
+- Top 50 common question list + generated suggestions
+- Retrieved grounded question cards with trace metadata
+- Admin tab: LLM health, SLA KPIs, snapshots, governance lifecycle updates
+
+Recommended folder: `assets/screenshots/`
+
+---
+
+## 🧠 System Architecture
+
+```mermaid
+graph TD
+    USER["User"]
+    UI["Streamlit UI (src/ui/app.py)"]
+    STYLE["PMG Theme (src/ui/style.py)"]
+    CLIENT["ApiClient (remote or in-process)"]
+    API["FastAPI (src/backend/api/app.py)"]
+    BOOT["BootstrapService"]
+    ROUTER["AgentRouterService"]
+    CHAT["ChatbotService"]
+    RET["HybridRetriever"]
+    LEX["Lexical TF-IDF"]
+    SEM["Semantic (OpenAI embeddings or local fallback)"]
+    GOV["GovernanceService"]
+    SAFE["SafetyService"]
+    TRANS["TranslationService (EN/FR + TTL cache)"]
+    OBS["ObservabilityStore (SQLite)"]
+    LOG["JsonEventLogger (JSONL)"]
+    LIB["QuestionLibraryService"]
+    LLMH["LlmHealthService"]
+
+    USER --> UI
+    UI --> STYLE
+    UI --> CLIENT
+    CLIENT --> API
+    CLIENT -. fallback .-> ROUTER
+    API --> BOOT
+    BOOT --> ROUTER
+    BOOT --> LIB
+    ROUTER --> TRANS
+    ROUTER --> SAFE
+    ROUTER --> LLMH
+    ROUTER --> CHAT
+    CHAT --> RET
+    RET --> LEX
+    RET --> SEM
+    ROUTER --> GOV
+    ROUTER --> OBS
+    ROUTER --> LOG
+```
+
+---
+
+## 🔄 Conversation Flow (State-Machine)
+
+```mermaid
+graph TD
+    START["Session Start"]
+    CONSENT["Consent Check"]
+    BLOCK["Consent Gate Response"]
+    IN["Normalize Input Language"]
+    SAFE["Safety Check (User Query)"]
+    SAFEBLOCK["Safety Block Response"]
+    ROUTE["Route Decision (hybrid/llm/deterministic)"]
+    RET["Grounded Retrieval + Answer"]
+    OUTSAFE["Safety Check (Assistant Response)"]
+    GOV["Governance Labels + Takeaways"]
+    OUT["Translate Output + Render Cards"]
+    TRACE["Persist Trace/Event/QA + Cache"]
+
+    START --> CONSENT
+    CONSENT -->|No consent| BLOCK
+    CONSENT -->|Consent granted| IN
+    IN --> SAFE
+    SAFE -->|Blocked| SAFEBLOCK
+    SAFE -->|Allowed| ROUTE
+    ROUTE --> RET
+    RET --> OUTSAFE
+    OUTSAFE --> GOV
+    GOV --> OUT
+    OUT --> TRACE
+```
+
+---
+
+## Safety and Source-of-Truth Boundaries
+
+### ChatGPT can be used for
+
+- grounded summarization of retrieved records
+- concise pattern synthesis from returned cards
+- follow-up suggestion generation
+
+### ChatGPT is **not** source-of-truth for
+
+- variable IDs not present in retrieved context
+- survey/wave assignments not present in data
+- compliance or governance policy decisions outside deterministic rules
+- telemetry state, consent state, or trace history
+
+Deterministic retrieval filters, consent enforcement, and observability records remain authoritative.
+
+---
+
+## Core Capabilities
+
+- Hybrid router with explicit modes: `hybrid`, `llm`, `deterministic`
+- Automatic LLM fallback to deterministic mode when health is degraded
+- Consent gate before user content processing
+- Deterministic safety checks with outbound-response validation and basic PII redaction
+- Grounded retrieval over Excel dictionary records (lexical + semantic weighted ranking)
+- Semantic retrieval supports OpenAI embeddings or local TF-IDF fallback
+- Starter prompt extraction from `.docx` survey files with cache signature checks
+- Upload pipeline for additional `.xlsx` and `.docx` assets via UI
+- Question library preload (top 50 + generated suggestions)
+- EN/FR translation utility with TTL cache
+- Query-result TTL cache in router for repeated requests
+- Observability stack:
+  - session, event, trace, and QA persistence in SQLite
+  - governance item lifecycle (`Draft`, `Approved`, `Deprecated`)
+  - JSONL event stream in `data/logs/app_events.jsonl`
+  - SLA metrics and monthly snapshots
+- Streamlit Admin tab for health, metrics, traces, and governance operations
+- Remote API mode with automatic in-process adapter fallback on HTTP errors
+
+---
+
+## Current Status
+
+### Implemented
+
+- FastAPI endpoints for router, consent, compliance, metrics, trace explorer, governance, and question library
+- Streamlit chatbot experience with utility controls and admin/monitoring tab
+- Bootstrap pipeline for index caching, prompt caching, observability wiring, and question library preload
+- Governance persistence and status updates from UI
+- Deterministic health signal for LLM availability (`Connected`/`Degraded`)
+
+### In Progress / Next
+
+- Broader language support beyond EN/FR dictionary mapping
+- More complete safety policy coverage and nuanced redaction
+- Automated tests and CI validation for router and API contracts
+
+---
+
+## Roadmap
+
+### Now
+
+- Stabilize API-first runtime and consent-governance workflow.
+- Improve quality and consistency of routed responses under each mode.
+
+### Next
+
+- Expand translation and localization behavior.
+- Add stronger automated regression coverage for endpoints and UI interactions.
+- Improve governance review ergonomics (batch actions, richer filtering).
+
+### Later
+
+- Production-grade auth and secret-management hardening.
+- External observability integrations and dashboard exports.
+- Broader data-source connectors beyond current Excel/docx ingestion.
+
+---
+
+## Quick Start (Local)
+
+### 1) Configure environment
+
 ```bash
-cd .
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
 cp .env.example .env
 ```
 
-## Run
+Set `OPENAI_API_KEY` in `.env` if you want OpenAI embeddings/chat summarization enabled.
+Set `OPENAI_CHAT_MODELS` (comma-separated) to control which ChatGPT models appear in the UI model selector.
+
+### 2) Create environment and install
+
 ```bash
-cd .
+python3 -m venv .venv
 source .venv/bin/activate
+pip install -e .
+```
+
+### 3) Run API service
+
+```bash
+PYTHONPATH=src uvicorn backend.api.app:app --host 127.0.0.1 --port 8000
+```
+
+### 4) Run Streamlit UI (second terminal)
+
+```bash
+source .venv/bin/activate
+export API_BASE_URL=http://127.0.0.1:8000
 PYTHONPATH=src streamlit run src/ui/app.py
 ```
 
-## Notes
-- If `OPENAI_API_KEY` is not set, semantic retrieval falls back to a local embedding approximation and chat summaries are deterministic.
-- When API key is set, OpenAI embeddings and chat summarization are used.
+Open [http://127.0.0.1:8501](http://127.0.0.1:8501)
+
+### Optional: Single-process adapter mode
+
+Leave `API_BASE_URL` empty; the UI client will call the same contracts via local in-process fallback.
+
+---
+
+## Environment Variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `EXCEL_SOURCE_PATH` | `data/market_research_capstone_draft_1.xlsx` | Primary Excel source for ingestion |
+| `INDEX_CACHE_DIR` | `data/cache` | Retrieval index and prompt cache location |
+| `OPENAI_API_KEY` | empty | Enables OpenAI embeddings and chat summarization |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model when API key is present |
+| `OPENAI_CHAT_MODEL` | `gpt-4.1-mini` | Chat summarization model |
+| `OBSERVABILITY_DB_PATH` | `data/observability.db` | SQLite store for sessions/events/traces/governance |
+| `LOGS_DIR` | `data/logs` | JSONL event log directory |
+| `API_INTERNAL_TOKEN` | `dev-internal-token` | Internal API auth token (`x-internal-token`) |
+| `API_BASE_URL` | empty | Remote API endpoint for UI client |
+| `GOVERNANCE_POLICY_VERSION` | `v1` | Policy version shown in compliance status |
+| `DEFAULT_ROUTER_MODE` | `hybrid` | Default routing mode if request mode is invalid |
+
+---
+
+## API Reference
+
+Auth and tracing notes:
+- All endpoints except `GET /api/health/llm` require header `x-internal-token`.
+- Middleware injects `x-trace-id` and `x-latency-ms` response headers.
+
+### Implemented Endpoints
+
+- `GET /api/health/llm` - LLM connectivity status (`Connected` or `Degraded`)
+- `POST /api/consent-record` - Persist consent decision and effective logging level
+- `GET /api/compliance-status` - Consent enforcement, policy version, governance counts, health summary
+- `POST /api/agent-router` - Main routed query endpoint returning response, labels, takeaways, cards, latency
+- `GET /api/metrics/sla` - P50/P95 latency, error/fallback rates, session completion, volume
+- `GET /api/metrics/monthly-snapshots` - Snapshot history + recent session rollups
+- `GET /api/traces/{trace_id}` - Trace and most recent QA payload
+- `GET /api/governance-items` - Governance items and status counts
+- `POST /api/governance-items/{item_id}/status` - Update governance lifecycle state
+- `GET /api/question-library` - Top questions, generated suggestions, approved governance library
+
+---
+
+## Testing and QA
+
+No automated test suite is currently committed in this repository (as of March 31, 2026).
+
+Recommended smoke checks:
+
+```bash
+PYTHONPATH=src uvicorn backend.api.app:app --host 127.0.0.1 --port 8000
+```
+
+```bash
+PYTHONPATH=src streamlit run src/ui/app.py
+```
+
+API smoke request example:
+
+```bash
+curl -X GET "http://127.0.0.1:8000/api/compliance-status" \
+  -H "x-internal-token: dev-internal-token"
+```
+
+---
+
+## Metrics and SLA Monitoring
+
+SLA endpoint:
+
+```bash
+curl "http://127.0.0.1:8000/api/metrics/sla" \
+  -H "x-internal-token: dev-internal-token"
+```
+
+Tracked metrics include:
+
+- `p50_latency_ms`
+- `p95_latency_ms`
+- `error_rate`
+- `fallback_rate`
+- `session_completion_rate`
+- `total_sessions`
+- `total_queries`
+
+---
+
+## Project Structure
+
+```text
+.
+├── data/
+│   ├── market_research_capstone_draft_1.xlsx
+│   ├── *.docx
+│   ├── cache/
+│   └── user_uploads/
+├── src/
+│   ├── backend/
+│   │   ├── api/
+│   │   │   ├── app.py
+│   │   │   ├── client.py
+│   │   │   └── schemas.py
+│   │   ├── cache/
+│   │   │   ├── index_cache.py
+│   │   │   └── ttl_cache.py
+│   │   ├── llm/openai_client.py
+│   │   ├── loaders/
+│   │   │   ├── excel_repository.py
+│   │   │   └── survey_prompt_loader.py
+│   │   ├── observability/
+│   │   │   ├── db.py
+│   │   │   └── json_logger.py
+│   │   ├── retrieval/
+│   │   │   ├── lexical.py
+│   │   │   ├── semantic.py
+│   │   │   └── hybrid.py
+│   │   ├── services/
+│   │   │   ├── agent_router_service.py
+│   │   │   ├── bootstrap_service.py
+│   │   │   ├── chatbot_service.py
+│   │   │   ├── governance_service.py
+│   │   │   ├── llm_health_service.py
+│   │   │   ├── question_library_service.py
+│   │   │   ├── safety_service.py
+│   │   │   └── translation_service.py
+│   │   ├── business_rules.py
+│   │   ├── config.py
+│   │   └── models.py
+│   └── ui/
+│       ├── app.py
+│       └── style.py
+├── pyproject.toml
+└── README.md
+```
+
+---
+
+## Known Limitations
+
+- No committed automated tests yet (manual validation required).
+- LLM health checks only API key presence, not end-to-end provider latency/error classes.
+- Translation is dictionary-based and currently limited to EN/FR.
+- Safety screening uses a small deterministic phrase list; policy coverage is intentionally narrow.
+- Internal API auth is a static shared token model (not role-based auth).
+- Data persistence is local SQLite/JSONL, suitable for prototype workflows.
+
+---
+
+## Troubleshooting
+
+### `401 Invalid internal token`
+
+- Ensure requests include `x-internal-token`.
+- Confirm token value matches `API_INTERNAL_TOKEN` in your `.env`.
+
+### UI shows `Startup failed: No valid Excel source files were found for ingestion.`
+
+- Confirm `EXCEL_SOURCE_PATH` exists.
+- Ensure uploaded `.xlsx` files are valid and accessible under `data/user_uploads/`.
+
+### LLM status remains `Degraded`
+
+- Set `OPENAI_API_KEY` in `.env`.
+- Restart the API/UI process after env changes.
+
+### Retrieval results look stale after data updates
+
+- Use `Force Rebuild Cache` in the UI.
+- Optionally use `Refresh Starter Prompts` if `.docx` prompt sources changed.
+
+---
+
+## Release Notes
+
+### 2026-03
+
+- Added API-first architecture (`FastAPI`) with protected internal endpoints
+- Added `AgentRouterService` with consent gate, safety checks, route decisioning, and trace metadata
+- Added observability persistence in SQLite plus JSONL event logging
+- Added governance labeling, lifecycle status management, and question library preload
+- Added EN/FR translation utility and router/query TTL caching
+- Expanded Streamlit UI with admin monitoring surfaces and governance operations
+
+---
+
+## Deployment Notes
+
+- Current default shape is local prototype deployment.
+- For hosted deployment, add:
+  - process manager and health probes,
+  - secure secret management,
+  - stronger auth/RBAC,
+  - centralized logging and backup/retention controls for observability data.
+
+---
+
+## Contributing
+
+1. Create a feature branch.
+2. Keep behavior changes aligned with grounded retrieval and consent/safety boundaries.
+3. Add tests (or smoke validation evidence) for endpoint and UI-impacting changes.
+4. Open a PR with notes on routing/compliance/governance impact.
+
+---
+
+## License
+
+Educational prototype for capstone/coursework and portfolio demonstration.
+Add a formal license file (`MIT`, `Apache-2.0`, etc.) before public distribution.

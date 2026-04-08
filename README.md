@@ -232,6 +232,14 @@ pip install -e .
 PYTHONPATH=src uvicorn backend.api.app:app --host 127.0.0.1 --port 8000
 ```
 
+### 3b) Run API service (production-tuned workers)
+
+```bash
+PYTHONPATH=src gunicorn -c src/backend/api/gunicorn_conf.py backend.api.app:app
+```
+
+This uses CPU-aware worker sizing, connection backlog tuning, keepalive tuning, and worker recycling for steadier latency under load.
+
 ### 4) Run Streamlit UI (second terminal)
 
 ```bash
@@ -248,6 +256,23 @@ Leave `API_BASE_URL` empty; the UI client will call the same contracts via local
 
 ---
 
+## Production Load Balancing
+
+Use [deploy/nginx/capstone_api.conf](deploy/nginx/capstone_api.conf) as a starting point to place NGINX in front of multiple API instances with `least_conn` balancing.
+
+Example backend nodes (one command per terminal/process):
+
+```bash
+API_BIND=127.0.0.1:8001 PYTHONPATH=src gunicorn -c src/backend/api/gunicorn_conf.py backend.api.app:app
+API_BIND=127.0.0.1:8002 PYTHONPATH=src gunicorn -c src/backend/api/gunicorn_conf.py backend.api.app:app
+API_BIND=127.0.0.1:8003 PYTHONPATH=src gunicorn -c src/backend/api/gunicorn_conf.py backend.api.app:app
+API_BIND=127.0.0.1:8004 PYTHONPATH=src gunicorn -c src/backend/api/gunicorn_conf.py backend.api.app:app
+```
+
+Then route client traffic through NGINX to spread load and reduce tail latency during traffic spikes.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Purpose |
@@ -257,12 +282,29 @@ Leave `API_BASE_URL` empty; the UI client will call the same contracts via local
 | `OPENAI_API_KEY` | empty | Enables OpenAI embeddings and chat summarization |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model when API key is present |
 | `OPENAI_CHAT_MODEL` | `gpt-4.1-mini` | Chat summarization model |
+| `RAG_ENABLED` | `true` | Enables confidence-gated RAG behavior |
+| `RAG_CONFIDENCE_THRESHOLD` | `0.72` | Confidence threshold above which LLM synthesis is skipped |
+| `RAG_SCORE_GAP_THRESHOLD` | `0.07` | Minimum top-vs-second score gap to treat retrieval as unambiguous |
+| `RAG_EMBED_CACHE_TTL` | `1800` | Query embedding cache TTL in seconds |
+| `RAG_ANSWER_CACHE_TTL` | `600` | Final answer cache TTL in seconds |
+| `RAG_BATCH_REBUILD` | `true` | Persist rebuilt index to disk during startup rebuild flow |
 | `OBSERVABILITY_DB_PATH` | `data/observability.db` | SQLite store for sessions/events/traces/governance |
 | `LOGS_DIR` | `data/logs` | JSONL event log directory |
 | `API_INTERNAL_TOKEN` | `dev-internal-token` | Internal API auth token (`x-internal-token`) |
 | `API_BASE_URL` | empty | Remote API endpoint for UI client |
 | `GOVERNANCE_POLICY_VERSION` | `v1` | Policy version shown in compliance status |
 | `DEFAULT_ROUTER_MODE` | `hybrid` | Default routing mode if request mode is invalid |
+| `API_BIND` | `0.0.0.0:8000` | Gunicorn bind address for API process |
+| `API_WORKERS` | `2*CPU+1` | Gunicorn worker process count (capped by `API_MAX_WORKERS`) |
+| `API_MAX_WORKERS` | `2*CPU+1` | Upper bound for auto worker sizing |
+| `API_THREADS` | `1` | Threads per worker process |
+| `API_BACKLOG` | `2048` | Pending connection backlog |
+| `API_KEEPALIVE` | `10` | HTTP keepalive seconds |
+| `API_TIMEOUT` | `60` | Worker request timeout seconds |
+| `API_GRACEFUL_TIMEOUT` | `30` | Graceful shutdown timeout seconds |
+| `API_MAX_REQUESTS` | `2000` | Worker recycle interval to avoid long-lived memory bloat |
+| `API_MAX_REQUESTS_JITTER` | `250` | Randomized recycle jitter to avoid synchronized restarts |
+| `API_LOG_LEVEL` | `info` | Gunicorn/Uvicorn log level |
 
 ---
 
@@ -278,6 +320,8 @@ Auth and tracing notes:
 - `POST /api/consent-record` - Persist consent decision and effective logging level
 - `GET /api/compliance-status` - Consent enforcement, policy version, governance counts, health summary
 - `POST /api/agent-router` - Main routed query endpoint returning response, labels, takeaways, cards, latency
+- `GET /api/index/health` - RAG index metadata (signature/version/doc+chunk counts/mode/cache hit rates)
+- `POST /api/index/rebuild` - Force index rebuild (optional prompt refresh) and return updated index health
 - `GET /api/metrics/sla` - P50/P95 latency, error/fallback rates, session completion, volume
 - `GET /api/metrics/monthly-snapshots` - Snapshot history + recent session rollups
 - `GET /api/traces/{trace_id}` - Trace and most recent QA payload
@@ -289,7 +333,7 @@ Auth and tracing notes:
 
 ## Testing and QA
 
-No automated test suite is currently committed in this repository (as of March 31, 2026).
+Automated unit tests are available under `tests/`.
 
 Recommended smoke checks:
 
@@ -306,6 +350,12 @@ API smoke request example:
 ```bash
 curl -X GET "http://127.0.0.1:8000/api/compliance-status" \
   -H "x-internal-token: dev-internal-token"
+```
+
+Run unit tests:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 ```
 
 ---

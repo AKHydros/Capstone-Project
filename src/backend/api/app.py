@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from functools import lru_cache
 import time
+import threading
 from typing import Annotated
 from uuid import uuid4
 
@@ -18,14 +18,35 @@ from .schemas import (
     ComplianceStatusResponse,
     ConsentRecordRequest,
     ConsentRecordResponse,
+    IndexHealthResponse,
     LlmHealthResponse,
+    ReindexRequest,
+    ReindexResponse,
 )
 
 
-@lru_cache(maxsize=1)
+_RUNTIME_LOCK = threading.Lock()
+_RUNTIME_INSTANCE: BootstrapArtifacts | None = None
+
+
 def _runtime() -> BootstrapArtifacts:
-    config = load_config()
-    return BootstrapService(config).build()
+    global _RUNTIME_INSTANCE
+    with _RUNTIME_LOCK:
+        if _RUNTIME_INSTANCE is None:
+            config = load_config()
+            _RUNTIME_INSTANCE = BootstrapService(config).build()
+        return _RUNTIME_INSTANCE
+
+
+def _rebuild_runtime(*, refresh_prompts: bool = False) -> BootstrapArtifacts:
+    global _RUNTIME_INSTANCE
+    with _RUNTIME_LOCK:
+        config = load_config()
+        _RUNTIME_INSTANCE = BootstrapService(config).build(
+            force_rebuild_cache=True,
+            force_refresh_prompts=refresh_prompts,
+        )
+        return _RUNTIME_INSTANCE
 
 
 def _auth_dependency(request: Request, x_internal_token: Annotated[str | None, Header()] = None) -> None:
@@ -38,6 +59,11 @@ def _auth_dependency(request: Request, x_internal_token: Annotated[str | None, H
 
 
 app = FastAPI(title="Capstone Chatbot API", version="1.0.0")
+
+
+@app.on_event("startup")
+def warm_runtime() -> None:
+    _runtime()
 
 
 @app.middleware("http")
@@ -147,11 +173,25 @@ def post_agent_router(request: AgentRouterRequest, raw_request: Request) -> Agen
         response=output.response,
         language_out=output.language_out,
         fallback_used=output.fallback_used,
+        retrieval_mode=output.retrieval_mode,
+        confidence_score=output.confidence_score,
+        cache_status=output.cache_status,
         labels=output.labels,
         takeaways=output.takeaways,
         latency_ms=output.latency_ms,
         cards=[asdict(card) for card in output.cards],
     )
+
+
+@app.get("/api/index/health", response_model=IndexHealthResponse, dependencies=[Depends(_auth_dependency)])
+def get_index_health() -> IndexHealthResponse:
+    return _index_health_payload(_runtime())
+
+
+@app.post("/api/index/rebuild", response_model=ReindexResponse, dependencies=[Depends(_auth_dependency)])
+def post_index_rebuild(payload: ReindexRequest) -> ReindexResponse:
+    runtime = _rebuild_runtime(refresh_prompts=payload.refresh_prompts)
+    return ReindexResponse(ok=True, index_health=_index_health_payload(runtime))
 
 
 @app.get("/api/metrics/sla", dependencies=[Depends(_auth_dependency)])
@@ -198,3 +238,42 @@ def get_question_library() -> dict[str, object]:
         "generated_questions": runtime.generated_questions,
         "approved_library": runtime.observability_store.list_governance_items(status="Approved", limit=200),
     }
+
+
+def _index_health_payload(runtime: BootstrapArtifacts) -> IndexHealthResponse:
+    semantic_cache_stats = runtime.chatbot_service.retriever.semantic.embedding_cache_stats()
+    answer_cache_stats = runtime.chatbot_service.answer_cache_stats()
+    router_cache_stats = runtime.agent_router_service.query_cache.stats()
+
+    def _hit_rate(hits: int, misses: int) -> float:
+        total = hits + misses
+        if total <= 0:
+            return 0.0
+        return round(hits / total, 4)
+
+    cache_hit_rates = {
+        "embedding": _hit_rate(semantic_cache_stats.hits, semantic_cache_stats.misses),
+        "answer": _hit_rate(answer_cache_stats.hits, answer_cache_stats.misses),
+        "router": _hit_rate(router_cache_stats.hits, router_cache_stats.misses),
+    }
+    cache_counters = {
+        "embedding_hits": semantic_cache_stats.hits,
+        "embedding_misses": semantic_cache_stats.misses,
+        "answer_hits": answer_cache_stats.hits,
+        "answer_misses": answer_cache_stats.misses,
+        "router_hits": router_cache_stats.hits,
+        "router_misses": router_cache_stats.misses,
+    }
+
+    return IndexHealthResponse(
+        index_version=runtime.index_version,
+        signature=runtime.index_signature,
+        document_count=runtime.index_document_count,
+        chunk_count=runtime.index_chunk_count,
+        last_rebuild_epoch=runtime.index_last_rebuild_epoch,
+        embedding_mode=runtime.index_embedding_mode,
+        cache_status_at_startup=runtime.cache_status_at_startup,
+        cache_status_current=runtime.cache_status.state,
+        cache_hit_rates=cache_hit_rates,
+        cache_counters=cache_counters,
+    )

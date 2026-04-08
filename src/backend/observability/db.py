@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Any
 
 
@@ -11,12 +12,30 @@ class ObservabilityStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            return conn
+
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-20000")
+        conn.execute("PRAGMA mmap_size=134217728")
+        conn.execute("PRAGMA busy_timeout=5000")
+        self._local.conn = conn
         return conn
+
+    def close(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -102,6 +121,20 @@ class ObservabilityStore:
                     total_sessions INTEGER,
                     total_queries INTEGER
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+                CREATE INDEX IF NOT EXISTS idx_events_trace_id ON events(trace_id);
+                CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
+                CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+                CREATE INDEX IF NOT EXISTS idx_traces_session_id ON traces(session_id);
+                CREATE INDEX IF NOT EXISTS idx_traces_created_at ON traces(created_at);
+                CREATE INDEX IF NOT EXISTS idx_traces_fallback ON traces(fallback_used);
+                CREATE INDEX IF NOT EXISTS idx_qa_pairs_trace_id ON qa_pairs(trace_id);
+                CREATE INDEX IF NOT EXISTS idx_qa_pairs_session_id ON qa_pairs(session_id);
+                CREATE INDEX IF NOT EXISTS idx_qa_pairs_created_at ON qa_pairs(created_at);
+                CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
+                CREATE INDEX IF NOT EXISTS idx_sessions_completion_status ON sessions(completion_status);
+                CREATE INDEX IF NOT EXISTS idx_governance_status_updated ON governance_items(status, updated_at);
                 """
             )
             conn.commit()
@@ -113,13 +146,31 @@ class ObservabilityStore:
                 """
                 INSERT INTO sessions(session_id, started_at, locale, consent, completion_status)
                 VALUES(?, ?, ?, ?, 'open')
-                ON CONFLICT(session_id) DO UPDATE SET
-                    locale=excluded.locale,
-                    consent=excluded.consent
+                ON CONFLICT(session_id) DO NOTHING
                 """,
                 (session_id, now, locale, int(consent)),
             )
             conn.commit()
+
+    def ensure_session_and_get_consent(self, session_id: str, locale: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT consent FROM sessions WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            if row is not None:
+                return bool(row["consent"])
+
+            conn.execute(
+                """
+                INSERT INTO sessions(session_id, started_at, locale, consent, completion_status)
+                VALUES(?, ?, ?, ?, 'open')
+                ON CONFLICT(session_id) DO NOTHING
+                """,
+                (session_id, _now(), locale, 0),
+            )
+            conn.commit()
+            return False
 
     def session_has_consent(self, session_id: str) -> bool:
         with self._connect() as conn:

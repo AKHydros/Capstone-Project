@@ -132,6 +132,18 @@ class ApiClient:
             self._local_question_library,
         )
 
+    def index_health(self) -> dict[str, Any]:
+        return self._remote_or_fallback(
+            lambda: self._get_json("/api/index/health"),
+            self._local_index_health,
+        )
+
+    def rebuild_index(self, *, refresh_prompts: bool = False) -> dict[str, Any]:
+        return self._remote_or_fallback(
+            lambda: self._post_json("/api/index/rebuild", {"refresh_prompts": refresh_prompts}),
+            lambda: self._local_rebuild_index(refresh_prompts=refresh_prompts),
+        )
+
     def _local_agent_router(
         self,
         *,
@@ -164,6 +176,9 @@ class ApiClient:
             "response": output.response,
             "language_out": output.language_out,
             "fallback_used": output.fallback_used,
+            "retrieval_mode": output.retrieval_mode,
+            "confidence_score": output.confidence_score,
+            "cache_status": output.cache_status,
             "labels": output.labels,
             "takeaways": output.takeaways,
             "latency_ms": output.latency_ms,
@@ -227,6 +242,46 @@ class ApiClient:
             "generated_questions": self.artifacts.generated_questions,
             "approved_library": self.artifacts.observability_store.list_governance_items(status="Approved", limit=200),
         }
+
+    def _local_index_health(self) -> dict[str, Any]:
+        semantic_cache_stats = self.artifacts.chatbot_service.retriever.semantic.embedding_cache_stats()
+        answer_cache_stats = self.artifacts.chatbot_service.answer_cache_stats()
+        router_cache_stats = self.artifacts.agent_router_service.query_cache.stats()
+
+        def hit_rate(hits: int, misses: int) -> float:
+            total = hits + misses
+            return round(hits / total, 4) if total else 0.0
+
+        return {
+            "index_version": self.artifacts.index_version,
+            "signature": self.artifacts.index_signature,
+            "document_count": self.artifacts.index_document_count,
+            "chunk_count": self.artifacts.index_chunk_count,
+            "last_rebuild_epoch": self.artifacts.index_last_rebuild_epoch,
+            "embedding_mode": self.artifacts.index_embedding_mode,
+            "cache_status_at_startup": self.artifacts.cache_status_at_startup,
+            "cache_status_current": self.artifacts.cache_status.state,
+            "cache_hit_rates": {
+                "embedding": hit_rate(semantic_cache_stats.hits, semantic_cache_stats.misses),
+                "answer": hit_rate(answer_cache_stats.hits, answer_cache_stats.misses),
+                "router": hit_rate(router_cache_stats.hits, router_cache_stats.misses),
+            },
+            "cache_counters": {
+                "embedding_hits": semantic_cache_stats.hits,
+                "embedding_misses": semantic_cache_stats.misses,
+                "answer_hits": answer_cache_stats.hits,
+                "answer_misses": answer_cache_stats.misses,
+                "router_hits": router_cache_stats.hits,
+                "router_misses": router_cache_stats.misses,
+            },
+        }
+
+    def _local_rebuild_index(self, *, refresh_prompts: bool) -> dict[str, Any]:
+        self.artifacts = BootstrapService(self.config).build(
+            force_rebuild_cache=True,
+            force_refresh_prompts=refresh_prompts,
+        )
+        return {"ok": True, "index_health": self._local_index_health()}
 
     def _remote_or_fallback(self, remote_fn: Callable[[], Any], fallback_fn: Callable[[], Any]) -> Any:
         if not self.using_remote_api:
