@@ -27,6 +27,26 @@ class TTLCache(Generic[T]):
         self._expired = 0
         self._lock = threading.Lock()
 
+    def __getstate__(self) -> dict[str, object]:
+        # Locks are not pickleable; serialize only data fields.
+        return {
+            "ttl_seconds": self.ttl_seconds,
+            "max_size": self.max_size,
+            "_store": self._store,
+            "_hits": self._hits,
+            "_misses": self._misses,
+            "_expired": self._expired,
+        }
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.ttl_seconds = int(state.get("ttl_seconds", 300))
+        self.max_size = int(state.get("max_size", 1024))
+        self._store = dict(state.get("_store", {}))
+        self._hits = int(state.get("_hits", 0))
+        self._misses = int(state.get("_misses", 0))
+        self._expired = int(state.get("_expired", 0))
+        self._lock = threading.Lock()
+
     def get(self, key: str) -> T | None:
         now = time.time()
         with self._lock:

@@ -28,6 +28,40 @@ Primary users:
 
 ---
 
+## Business-Facing Functionality Highlights
+
+### Faster Research Answers
+
+- Natural-language search across survey dictionaries so teams can ask questions instead of manually scanning spreadsheets.
+- Question-level lookup by survey and item (for example, `PMG20_GAM question 12a`) to return exact, grounded records.
+- Dropdown/allowed-value support to surface coded response options directly in chat.
+
+### Better Decision Support
+
+- Consistent answers tied to source survey metadata (survey, wave, question ID, and labels).
+- Optional conversational summaries for executives and stakeholders who need quick interpretation.
+- Suggested follow-up prompts to accelerate exploratory analysis sessions.
+
+### Governance and Compliance Confidence
+
+- Consent-first workflow that blocks processing until user consent is provided.
+- Safety checks on both user input and assistant output to reduce policy and reputational risk.
+- Governance lifecycle tracking (`Draft`, `Approved`, `Deprecated`) for institutional review workflows.
+
+### Operational Visibility
+
+- Trace IDs, latency tracking, and SLA snapshots to monitor service quality over time.
+- Admin dashboard for system health, fallback rate, error trends, and governance activity.
+- Deterministic fallbacks when LLM connectivity is degraded, improving service continuity.
+
+### Business Outcomes This Supports
+
+- Reduced time-to-answer for research and analytics teams.
+- Higher first-response accuracy for survey question and value-label lookups.
+- Stronger auditability for stakeholder reviews, compliance checks, and leadership reporting.
+
+---
+
 ## Project Documents
 
 - Current implementation overview: this README.

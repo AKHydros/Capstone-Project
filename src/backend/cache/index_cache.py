@@ -115,7 +115,31 @@ class IndexCache:
         metadata = bundle.metadata
         if not isinstance(metadata, CacheMetadata):
             return None
-        return bundle
+        try:
+            normalized_metadata = self._normalize_metadata(metadata, bundle.retriever)
+        except Exception:
+            return None
+        return CacheBundle(metadata=normalized_metadata, retriever=bundle.retriever)
+
+    def _normalize_metadata(self, metadata: CacheMetadata, retriever: HybridRetriever) -> CacheMetadata:
+        signature = getattr(metadata, "signature", "")
+        if not signature:
+            raise ValueError("Invalid cache metadata: missing signature")
+
+        created_at_epoch = int(getattr(metadata, "created_at_epoch", 0) or 0)
+        document_count = int(getattr(metadata, "document_count", len(retriever.records)) or 0)
+        chunk_count = int(getattr(metadata, "chunk_count", len(getattr(retriever, "chunks", []))) or 0)
+        embedding_mode = str(getattr(metadata, "embedding_mode", getattr(retriever.semantic, "mode", "unknown")) or "unknown")
+        index_version = str(getattr(metadata, "index_version", "legacy") or "legacy")
+
+        return CacheMetadata(
+            index_version=index_version,
+            signature=signature,
+            created_at_epoch=created_at_epoch,
+            document_count=document_count,
+            chunk_count=chunk_count,
+            embedding_mode=embedding_mode,
+        )
 
 
 def build_signature(
