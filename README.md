@@ -65,6 +65,7 @@ Primary users:
 ## Project Documents
 
 - Current implementation overview: this README.
+- Method-by-method code reference: `docs/METHOD_ANNOTATIONS.md`.
 - Data inputs: `data/market_research_capstone_draft_1.xlsx` plus optional uploads in `data/user_uploads/`.
 - Prompt seed inputs: `.docx` files under `data/` (cached to `data/cache/starter_prompts.json`).
 
