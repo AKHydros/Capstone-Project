@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from ..business_rules import RETRIEVAL_RULES, apply_filters
 from ..models import QuestionRecord
@@ -61,6 +62,7 @@ class HybridRetriever:
         """Runs weighted lexical+semantic ranking, filtering, and returns diagnostics."""
         top_k = top_k or RETRIEVAL_RULES.top_k
         lexical_scores = self.lexical.score(query)
+        exact_match_boosts = self._exact_match_boosts(query)
         try:
             semantic_scores, embedding_cache_hit = self.semantic.score_with_meta(query)
             lexical_weight = RETRIEVAL_RULES.lexical_weight
@@ -79,6 +81,7 @@ class HybridRetriever:
                 lexical_weight * lexical_scores[idx]
                 + semantic_weight * semantic_scores[idx]
             )
+            score += exact_match_boosts.get(chunk.record_index, 0.0)
             if score >= RETRIEVAL_RULES.min_score_threshold:
                 chunk_scores.append((score, chunk))
 
@@ -151,3 +154,40 @@ class HybridRetriever:
             top_k=top_k,
         )
         return [item.record for item in result.scored_results]
+
+    def _exact_match_boosts(self, query: str) -> dict[int, float]:
+        """Computes deterministic score boosts for exact variable/question references in the query."""
+        lowered = query.lower()
+        boosts: dict[int, float] = {}
+
+        full_id_matches = set(
+            re.findall(r"\b[a-z]{3}\d{2}_[a-z]{3}_q{1,2}\d+(?:\.\d+)?[a-z]?\b", lowered)
+        )
+
+        survey_tokens = {
+            f"{prefix}{year}_{suffix}"
+            for prefix, year, suffix in re.findall(r"\b([a-z]{3})[\s_-]?(\d{2})[\s_-]?([a-z]{3})\b", lowered)
+        }
+        question_tokens = {
+            token
+            for token in re.findall(r"\bq(?:uestion)?\s*(\d+(?:\.\d+)?[a-z]?)\b", lowered)
+        }
+
+        for idx, record in enumerate(self.records):
+            record_id = record.question_id.lower()
+            if record_id in full_id_matches:
+                boosts[idx] = max(boosts.get(idx, 0.0), 0.45)
+                continue
+
+            if not survey_tokens or not question_tokens:
+                continue
+            if record.survey_name.lower() not in survey_tokens:
+                continue
+
+            component_match = re.search(r"_q{1,2}(\d+(?:\.\d+)?[a-z]?)\b", record_id)
+            if not component_match:
+                continue
+            if component_match.group(1) in question_tokens:
+                boosts[idx] = max(boosts.get(idx, 0.0), 0.35)
+
+        return boosts

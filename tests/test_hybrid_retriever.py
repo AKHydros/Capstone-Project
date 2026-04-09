@@ -68,6 +68,26 @@ class HybridRetrieverFailureFallbackTests(unittest.TestCase):
         ranked = retriever.search("companies")
         self.assertEqual([item.question_id for item in ranked], ["PMG20_GAM_q12a", "PMG20_GAM_q12b"])
 
+    def test_exact_question_id_query_boosts_matching_record(self) -> None:
+        """Assert exact variable-ID mentions boost the matching record above lexical-only ranking."""
+        records = [
+            _record("PMG20_GAM_q12a", "Consolidated number of financial companies you use"),
+            _record("PMG20_GAM_q12b", "Switched financial companies"),
+        ]
+        chunks = [
+            TextChunk(chunk_id="PMG20_GAM_q12a:0", record_index=0, question_id=records[0].question_id, text="companies use"),
+            TextChunk(chunk_id="PMG20_GAM_q12b:0", record_index=1, question_id=records[1].question_id, text="switched companies"),
+        ]
+        retriever = HybridRetriever(
+            records=records,
+            chunks=chunks,
+            lexical=_StaticLexical([0.20, 0.60]),
+            semantic=_FailingSemantic(),
+        )
+
+        ranked = retriever.search("For PMG20_GAM_q12a what is the label?")
+        self.assertEqual([item.question_id for item in ranked], ["PMG20_GAM_q12a", "PMG20_GAM_q12b"])
+
 
 if __name__ == "__main__":
     unittest.main()

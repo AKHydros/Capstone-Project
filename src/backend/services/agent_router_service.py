@@ -33,6 +33,8 @@ class AgentRouterInput:
     llm_model: str | None = None
     inference: dict[str, int | float] | None = None
     input_method: str = "document"
+    conversation_context: list[dict[str, str]] | None = None
+    user_role: str = "viewer"
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,17 @@ class ResultCard:
     topic_label_sources: dict[str, str]
     measurement_level: str
     source_file: str
+
+
+@dataclass(frozen=True)
+class SourceCitation:
+    index: int
+    marker: str
+    label: str
+    question_id: str
+    survey_name: str
+    wave_year: str
+    question_text: str
 
 
 @dataclass(frozen=True)
@@ -61,6 +74,11 @@ class AgentRouterOutput:
     takeaways: list[str]
     latency_ms: float
     cards: list[ResultCard]
+    sources: list[SourceCitation]
+    answer_mode: str
+    needs_clarification: bool
+    unanswered_reason: str | None
+    fallback_reason: str | None
 
 
 class AgentRouterService:
@@ -94,6 +112,7 @@ class AgentRouterService:
         language = self.translation_service.normalize_language(request.language)
         filters = request.filters or {}
         mode = request.mode if request.mode in VALID_MODES else self.default_mode
+        normalized_role = request.user_role if request.user_role in {"viewer", "analyst", "admin"} else "viewer"
 
         consent = self.store.ensure_session_and_get_consent(
             request.session_id,
@@ -115,8 +134,25 @@ class AgentRouterService:
                 takeaways=["Consent required before processing user content."],
                 latency_ms=round(latency_ms, 2),
                 cards=[],
+                sources=[],
+                answer_mode="direct_answer",
+                needs_clarification=False,
+                unanswered_reason="no_cards",
+                fallback_reason=None,
             )
-            self._record_event(request, output, payload={"consent_required": True}, include_content=False)
+            self._record_event(
+                request,
+                output,
+                payload={"consent_required": True, "user_role": normalized_role},
+                include_content=False,
+            )
+            self.store.record_unanswered(
+                trace_id=trace_id,
+                session_id=request.session_id,
+                user_role=normalized_role,
+                reason="no_cards",
+                query_text=self.safety_service.redact_pii(request.query),
+            )
             return output
 
         translated_query = self.translation_service.translate(request.query, source_language=language, target_language="en")
@@ -138,8 +174,25 @@ class AgentRouterService:
                 takeaways=["Blocked by deterministic safety policy."],
                 latency_ms=round(latency_ms, 2),
                 cards=[],
+                sources=[],
+                answer_mode="direct_answer",
+                needs_clarification=False,
+                unanswered_reason="no_cards",
+                fallback_reason="safety_fallback",
             )
-            self._record_event(request, output, payload={"reason": safety_result.reason}, include_content=True)
+            self._record_event(
+                request,
+                output,
+                payload={"reason": safety_result.reason, "user_role": normalized_role},
+                include_content=True,
+            )
+            self.store.record_unanswered(
+                trace_id=trace_id,
+                session_id=request.session_id,
+                user_role=normalized_role,
+                reason="no_cards",
+                query_text=self.safety_service.redact_pii(request.query),
+            )
             return output
 
         cache_key = self._cache_key(
@@ -150,6 +203,7 @@ class AgentRouterService:
             request.llm_provider,
             request.llm_model,
             request.inference or {},
+            request.conversation_context or [],
         )
         cached_payload = self.query_cache.get(cache_key)
         if cached_payload is not None:
@@ -177,6 +231,19 @@ class AgentRouterService:
                 takeaways=list(cached_payload["takeaways"]),
                 latency_ms=round(latency_ms, 2),
                 cards=[ResultCard(**card) for card in cached_payload["cards"]],
+                sources=[SourceCitation(**source) for source in cached_payload.get("sources", [])],
+                answer_mode=str(cached_payload.get("answer_mode", "direct_answer")),
+                needs_clarification=bool(cached_payload.get("needs_clarification", False)),
+                unanswered_reason=(
+                    str(cached_payload["unanswered_reason"])
+                    if cached_payload.get("unanswered_reason") is not None
+                    else None
+                ),
+                fallback_reason=(
+                    str(cached_payload["fallback_reason"])
+                    if cached_payload.get("fallback_reason") is not None
+                    else None
+                ),
             )
             self.store.record_trace(
                 trace_id=trace_id,
@@ -193,17 +260,27 @@ class AgentRouterService:
                     "cache": "hit",
                     "lookup_mode": lookup_mode,
                     "variant_count": variant_count,
+                    "user_role": normalized_role,
                 },
                 include_content=True,
             )
             self._record_qa(request, translated_query.text, output)
+            if output.unanswered_reason:
+                self.store.record_unanswered(
+                    trace_id=trace_id,
+                    session_id=request.session_id,
+                    user_role=normalized_role,
+                    reason=output.unanswered_reason,
+                    query_text=self.safety_service.redact_pii(request.query),
+                )
             return output
 
-        route_used, fallback_used = self._decide_route(mode)
+        route_used, fallback_used, fallback_reason = self._decide_route(mode)
         provider_supported = request.llm_provider.lower() in {"chatgpt", "openai"}
         if route_used == "llm" and not provider_supported:
             route_used = "deterministic"
             fallback_used = True
+            fallback_reason = "unsupported_provider"
         survey_name = filters.get("survey_name")
         wave_year = filters.get("wave_year")
         topic_label = filters.get("topic_label")
@@ -219,6 +296,7 @@ class AgentRouterService:
             llm_provider=request.llm_provider,
             llm_model=request.llm_model,
             inference=request.inference,
+            conversation_context=request.conversation_context,
         )
         response_text = response_payload.answer
         response_safety = self.safety_service.check_assistant_response(response_text)
@@ -226,6 +304,7 @@ class AgentRouterService:
             response_text = "I cannot provide that response due to safety policy."
             route_used = "deterministic"
             fallback_used = True
+            fallback_reason = "safety_fallback"
 
         governance = self.governance_service.generate_labels_takeaways(
             query=translated_query.text,
@@ -235,6 +314,8 @@ class AgentRouterService:
 
         translated_answer = self.translation_service.translate(response_text, source_language="en", target_language=language)
         cards = [self._to_card(item) for item in response_payload.ranked_results]
+        sources = self._build_sources(cards)
+        unanswered_reason = self._classify_unanswered(cards, response_payload.needs_clarification)
 
         latency_ms = (time.perf_counter() - started) * 1000
         output = AgentRouterOutput(
@@ -253,6 +334,11 @@ class AgentRouterService:
             takeaways=governance.takeaways,
             latency_ms=round(latency_ms, 2),
             cards=cards,
+            sources=sources,
+            answer_mode=response_payload.answer_mode,
+            needs_clarification=response_payload.needs_clarification,
+            unanswered_reason=unanswered_reason,
+            fallback_reason=fallback_reason,
         )
 
         self.query_cache.set(
@@ -270,6 +356,11 @@ class AgentRouterService:
                 "labels": output.labels,
                 "takeaways": output.takeaways,
                 "cards": [asdict(card) for card in output.cards],
+                "sources": [asdict(source) for source in output.sources],
+                "answer_mode": output.answer_mode,
+                "needs_clarification": output.needs_clarification,
+                "unanswered_reason": output.unanswered_reason,
+                "fallback_reason": output.fallback_reason,
             },
         )
 
@@ -288,10 +379,19 @@ class AgentRouterService:
                 "cache": "miss",
                 "lookup_mode": response_payload.lookup_mode,
                 "variant_count": response_payload.variant_count,
+                "user_role": normalized_role,
             },
             include_content=True,
         )
         self._record_qa(request, translated_query.text, output)
+        if output.unanswered_reason:
+            self.store.record_unanswered(
+                trace_id=trace_id,
+                session_id=request.session_id,
+                user_role=normalized_role,
+                reason=output.unanswered_reason,
+                query_text=self.safety_service.redact_pii(request.query),
+            )
 
         self.governance_service.save_qa_item(
             question_text=request.query,
@@ -337,6 +437,11 @@ class AgentRouterService:
             "retrieval_mode": output.retrieval_mode,
             "confidence_score": output.confidence_score,
             "cache_status": output.cache_status,
+            "answer_mode": output.answer_mode,
+            "needs_clarification": output.needs_clarification,
+            "unanswered_reason": output.unanswered_reason,
+            "fallback_reason": output.fallback_reason,
+            "user_role": request.user_role,
             **payload,
         }
         if include_content:
@@ -379,8 +484,16 @@ class AgentRouterService:
         llm_provider: str,
         llm_model: str | None,
         inference: dict[str, int | float],
+        conversation_context: list[dict[str, str]],
     ) -> str:
         """Builds deterministic router-response cache key from request dimensions."""
+        context_items = [
+            {
+                "role": str(turn.get("role", "")).strip().lower(),
+                "content": str(turn.get("content", "")).strip(),
+            }
+            for turn in conversation_context[-20:]
+        ]
         payload = {
             "q": query_en,
             "f": filters,
@@ -389,25 +502,26 @@ class AgentRouterService:
             "p": llm_provider.lower(),
             "model": llm_model or "",
             "i": inference,
+            "ctx": context_items,
         }
         raw = json.dumps(payload, sort_keys=True)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def _decide_route(self, mode: str) -> tuple[str, bool]:
+    def _decide_route(self, mode: str) -> tuple[str, bool, str | None]:
         """Chooses deterministic vs LLM route based on mode and health."""
         health = self.llm_health_service.status()
         llm_available = self.chatbot_service.llm_client.enabled and health.status == "Connected"
 
         if mode == "deterministic":
-            return "deterministic", False
+            return "deterministic", False, None
         if mode == "llm":
             if llm_available:
-                return "llm", False
-            return "deterministic", True
+                return "llm", False, None
+            return "deterministic", True, "llm_unavailable"
 
         if llm_available:
-            return "llm", False
-        return "deterministic", True
+            return "llm", False, None
+        return "deterministic", True, "llm_unavailable"
 
     def _to_card(self, record: QuestionRecord) -> ResultCard:
         """Maps `QuestionRecord` to API response card shape."""
@@ -421,3 +535,28 @@ class AgentRouterService:
             measurement_level=record.measurement_level,
             source_file=record.source_file,
         )
+
+    def _build_sources(self, cards: list[ResultCard]) -> list[SourceCitation]:
+        """Builds ordered citation markers from returned result cards."""
+        sources: list[SourceCitation] = []
+        for idx, card in enumerate(cards, start=1):
+            sources.append(
+                SourceCitation(
+                    index=idx,
+                    marker=f"[{idx}]",
+                    label=f"{card.question_id} | {card.survey_name} {card.wave_year}",
+                    question_id=card.question_id,
+                    survey_name=card.survey_name,
+                    wave_year=card.wave_year,
+                    question_text=card.question_text,
+                )
+            )
+        return sources
+
+    def _classify_unanswered(self, cards: list[ResultCard], needs_clarification: bool) -> str | None:
+        """Classifies unresolved interactions for unanswered-query analytics."""
+        if not cards:
+            return "no_cards"
+        if needs_clarification:
+            return "clarifier_only"
+        return None

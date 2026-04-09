@@ -13,6 +13,21 @@ from ..models import ChatResponse, QuestionRecord
 from ..retrieval.hybrid import HybridRetriever, RetrievalDiagnostics
 
 
+_CONTEXT_FIELD_DISPLAY: dict[str, str] = {
+    "variable": "Variable",
+    "position": "Position",
+    "label": "Label",
+    "measurement_level": "Measurement Level",
+    "role": "Role",
+    "column_width": "Column Width",
+    "alignment": "Alignment",
+    "print_format": "Print Format",
+    "write_format": "Write Format",
+    "missing_values": "Missing Values",
+}
+_DEFAULT_CONTEXT_FIELDS: tuple[str, ...] = ("position", "label", "measurement_level", "role")
+
+
 @dataclass
 class ChatbotService:
     retriever: HybridRetriever
@@ -22,7 +37,8 @@ class ChatbotService:
     rag_confidence_threshold_override: float | None = None
     rag_score_gap_threshold_override: float | None = None
     rag_answer_cache_ttl_override: int | None = None
-    answer_cache: TTLCache[dict[str, str]] = field(init=False)
+    answer_cache: TTLCache[dict[str, object]] = field(init=False)
+    record_index: dict[str, QuestionRecord] = field(init=False, repr=False)
     rag_enabled: bool = field(init=False)
     rag_confidence_threshold: float = field(init=False)
     rag_score_gap_threshold: float = field(init=False)
@@ -48,6 +64,7 @@ class ChatbotService:
             else _env_int("RAG_ANSWER_CACHE_TTL", default=600)
         )
         self.answer_cache = TTLCache(ttl_seconds=max(answer_cache_ttl, 30), max_size=4096)
+        self.record_index = {record.question_id: record for record in self.retriever.records}
 
     def chat(
         self,
@@ -60,8 +77,22 @@ class ChatbotService:
         llm_provider: str = "chatgpt",
         llm_model: str | None = None,
         inference: dict[str, int | float] | None = None,
+        conversation_context: list[dict[str, str]] | None = None,
     ) -> ChatResponse:
         """Main chat pipeline: exact-ID lookup, allowed-values path, hybrid retrieval, LLM/deterministic answer selection, answer caching."""
+        exact_cache_key = self._exact_lookup_cache_key(
+            query=query,
+            survey_name=survey_name,
+            wave_year=wave_year,
+            topic_label=topic_label,
+            topic_source_type=topic_source_type,
+        )
+        cached_exact_lookup = self.answer_cache.get(exact_cache_key)
+        if cached_exact_lookup is not None and str(cached_exact_lookup.get("cache_type", "")) == "exact_lookup":
+            cached_response = self._cached_chat_response(cached_exact_lookup)
+            if cached_response is not None:
+                return cached_response
+
         exact_response = self._exact_question_lookup_response(
             query=query,
             survey_name=survey_name,
@@ -70,6 +101,7 @@ class ChatbotService:
             topic_source_type=topic_source_type,
         )
         if exact_response is not None:
+            self.answer_cache.set(exact_cache_key, self._serialize_chat_response(exact_response, cache_type="exact_lookup"))
             return exact_response
 
         quick_response = self._quick_allowed_values_response(
@@ -80,6 +112,7 @@ class ChatbotService:
             topic_source_type=topic_source_type,
         )
         if quick_response is not None:
+            self.answer_cache.set(exact_cache_key, self._serialize_chat_response(quick_response, cache_type="exact_lookup"))
             return quick_response
 
         search = self.retriever.search_with_details(
@@ -99,6 +132,7 @@ class ChatbotService:
                 answer="I could not find grounded matches in the current Excel dictionary. Try broader wording or relax filters.",
                 ranked_results=[],
                 retrieval_mode="deterministic",
+                answer_mode="direct_answer",
                 confidence_score=confidence,
                 embedding_cache_hit=embedding_cache_hit,
                 answer_cache_hit=False,
@@ -128,15 +162,18 @@ class ChatbotService:
             cards=cards,
             retrieval_mode=retrieval_mode,
             llm_model=llm_model,
+            conversation_context=conversation_context or [],
         )
         cached_answer = self.answer_cache.get(answer_cache_key)
-        if cached_answer is not None:
+        if cached_answer is not None and str(cached_answer.get("cache_type", "")) == "hybrid_answer":
             return ChatResponse(
                 answer=str(cached_answer.get("answer", "")),
                 ranked_results=cards,
                 lookup_mode="hybrid_fallback",
                 variant_count=0,
                 retrieval_mode=str(cached_answer.get("retrieval_mode", retrieval_mode)),
+                answer_mode=str(cached_answer.get("answer_mode", "direct_answer")),
+                needs_clarification=bool(cached_answer.get("needs_clarification", False)),
                 confidence_score=confidence,
                 embedding_cache_hit=embedding_cache_hit,
                 answer_cache_hit=True,
@@ -144,6 +181,7 @@ class ChatbotService:
 
         if should_use_llm:
             context = build_grounded_context(cards)
+            conversation_block = self._conversation_context_block(conversation_context or [])
             system_prompt = (
                 "You are a grounded research dictionary assistant. "
                 "Be conversational, direct, and quick to read. "
@@ -152,6 +190,7 @@ class ChatbotService:
                 "If uncertain, say so plainly."
             )
             user_prompt = (
+                f"{conversation_block}"
                 f"User query: {query}\n\n"
                 f"Retrieved records:\n{context}\n\n"
                 "Return: (1) direct answer, (2) notable patterns, (3) 1 suggested follow-up query. "
@@ -174,8 +213,11 @@ class ChatbotService:
         self.answer_cache.set(
             answer_cache_key,
             {
+                "cache_type": "hybrid_answer",
                 "answer": answer,
                 "retrieval_mode": retrieval_mode,
+                "answer_mode": "summary" if should_use_llm else "direct_answer",
+                "needs_clarification": False,
             },
         )
 
@@ -185,6 +227,8 @@ class ChatbotService:
             lookup_mode="hybrid_fallback",
             variant_count=0,
             retrieval_mode=retrieval_mode,
+            answer_mode="summary" if should_use_llm else "direct_answer",
+            needs_clarification=False,
             confidence_score=confidence,
             embedding_cache_hit=embedding_cache_hit,
             answer_cache_hit=False,
@@ -193,6 +237,83 @@ class ChatbotService:
     def answer_cache_stats(self) -> CacheStats:
         """Returns answer cache usage counters."""
         return self.answer_cache.stats()
+
+    def _exact_lookup_cache_key(
+        self,
+        *,
+        query: str,
+        survey_name: str | None,
+        wave_year: str | None,
+        topic_label: str | None,
+        topic_source_type: str | None,
+    ) -> str:
+        """Creates deterministic cache key for exact lookup responses."""
+        payload = {
+            "q": _normalize_query(query),
+            "filters": {
+                "survey_name": survey_name,
+                "wave_year": wave_year,
+                "topic_label": topic_label,
+                "topic_source_type": topic_source_type,
+            },
+            "lookup_mode": "exact_lookup",
+        }
+        raw = json.dumps(payload, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _serialize_chat_response(self, response: ChatResponse, *, cache_type: str) -> dict[str, object]:
+        """Serializes a `ChatResponse` into a cache-safe payload."""
+        return {
+            "cache_type": cache_type,
+            "answer": response.answer,
+            "ranked_question_ids": [record.question_id for record in response.ranked_results],
+            "lookup_mode": response.lookup_mode,
+            "variant_count": response.variant_count,
+            "retrieval_mode": response.retrieval_mode,
+            "answer_mode": response.answer_mode,
+            "needs_clarification": response.needs_clarification,
+            "confidence_score": response.confidence_score,
+            "embedding_cache_hit": response.embedding_cache_hit,
+        }
+
+    def _cached_chat_response(self, payload: dict[str, object]) -> ChatResponse | None:
+        """Restores cached chat payload into a `ChatResponse` with resolved ranked records."""
+        ranked_ids = payload.get("ranked_question_ids")
+        if not isinstance(ranked_ids, list):
+            return None
+
+        ranked_results: list[QuestionRecord] = []
+        for raw_id in ranked_ids:
+            if not isinstance(raw_id, str):
+                continue
+            record = self.record_index.get(raw_id)
+            if record is not None:
+                ranked_results.append(record)
+
+        confidence_score = payload.get("confidence_score")
+        if isinstance(confidence_score, (int, float)):
+            parsed_confidence = float(confidence_score)
+        else:
+            parsed_confidence = None
+
+        raw_variant_count = payload.get("variant_count", 0)
+        try:
+            parsed_variant_count = int(raw_variant_count)
+        except (TypeError, ValueError):
+            parsed_variant_count = 0
+
+        return ChatResponse(
+            answer=str(payload.get("answer", "")),
+            ranked_results=ranked_results,
+            lookup_mode=str(payload.get("lookup_mode", "hybrid_fallback")),
+            variant_count=parsed_variant_count,
+            retrieval_mode=str(payload.get("retrieval_mode", "deterministic")),
+            answer_mode=str(payload.get("answer_mode", "direct_answer")),
+            needs_clarification=bool(payload.get("needs_clarification", False)),
+            confidence_score=parsed_confidence,
+            embedding_cache_hit=bool(payload.get("embedding_cache_hit", False)),
+            answer_cache_hit=True,
+        )
 
     def _should_use_llm(
         self,
@@ -266,6 +387,24 @@ class ChatbotService:
 
         return "\n".join(lines)
 
+    def _conversation_context_block(self, conversation_context: list[dict[str, str]]) -> str:
+        """Formats recent conversation turns into a compact prompt context block."""
+        if not conversation_context:
+            return ""
+        lines: list[str] = []
+        for turn in conversation_context[-20:]:
+            role = str(turn.get("role", "")).strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(turn.get("content", "")).strip()
+            if not content:
+                continue
+            label = "User" if role == "user" else "Assistant"
+            lines.append(f"{label}: {content}")
+        if not lines:
+            return ""
+        return "Recent conversation context:\n" + "\n".join(lines) + "\n\n"
+
     def _answer_cache_key(
         self,
         *,
@@ -277,10 +416,13 @@ class ChatbotService:
         cards: list[QuestionRecord],
         retrieval_mode: str,
         llm_model: str | None,
+        conversation_context: list[dict[str, str]],
     ) -> str:
         """Creates deterministic key for answer-level cache."""
         top_ids = [item.question_id for item in cards[:8]]
         top_ids_fingerprint = hashlib.sha256("|".join(top_ids).encode("utf-8")).hexdigest()
+        compact_context = self._conversation_context_block(conversation_context)
+        context_fingerprint = hashlib.sha256(compact_context.encode("utf-8")).hexdigest() if compact_context else ""
         payload = {
             "q": _normalize_query(query),
             "filters": {
@@ -292,6 +434,7 @@ class ChatbotService:
             "top_ids_fp": top_ids_fingerprint,
             "retrieval_mode": retrieval_mode,
             "llm_model": llm_model or "",
+            "context_fp": context_fingerprint,
         }
         raw = json.dumps(payload, sort_keys=True)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -338,9 +481,10 @@ class ChatbotService:
                 (variant for variant in variant_keys if len(variant) > len(ref_number)),
                 variant_keys[0],
             )
+            detail_target = "exact context fields" if self._extract_requested_context_fields(query) else "exact dropdown values"
             answer = (
                 f"I found multiple variants for **{resolved_survey} question {ref_number}**: {options_text}. "
-                f"Please choose one variant (for example, `{suggested_variant}`) and I will return the exact dropdown values."
+                f"Please choose one variant (for example, `{suggested_variant}`) and I will return the {detail_target}."
             )
             ranked_results = [self._best_variant_record(variant_map[key]) for key in variant_keys]
             return ChatResponse(
@@ -349,6 +493,8 @@ class ChatbotService:
                 lookup_mode="exact_id",
                 variant_count=len(variant_keys),
                 retrieval_mode="deterministic",
+                answer_mode="clarifier",
+                needs_clarification=True,
             )
 
         if not ref_suffix and len(variant_map) == 1:
@@ -361,6 +507,7 @@ class ChatbotService:
             return None
 
         return self._build_specific_variant_response(
+            query=query,
             survey_name=resolved_survey,
             variant_key=selected_key,
             records=selected_records,
@@ -420,6 +567,8 @@ class ChatbotService:
                 lookup_mode="exact_id",
                 variant_count=max(1, len(ranked_results)),
                 retrieval_mode="deterministic",
+                answer_mode="allowed_values",
+                needs_clarification=False,
             )
 
         if len(records_with_values) == 1:
@@ -435,6 +584,8 @@ class ChatbotService:
                 lookup_mode="exact_id",
                 variant_count=1,
                 retrieval_mode="deterministic",
+                answer_mode="allowed_values",
+                needs_clarification=False,
             )
 
         sections: list[str] = []
@@ -457,6 +608,8 @@ class ChatbotService:
             lookup_mode="exact_id",
             variant_count=max(1, len(ranked_results)),
             retrieval_mode="deterministic",
+            answer_mode="clarifier",
+            needs_clarification=True,
         )
 
     def _is_allowed_values_intent(self, query: str) -> bool:
@@ -479,18 +632,26 @@ class ChatbotService:
 
     def _extract_survey_name(self, query: str) -> str | None:
         """Extracts survey token like `PMG20_GAM` from free text."""
+        id_match = re.search(r"\b([A-Za-z]{3}\d{2}_[A-Za-z]{3})(?=_q{1,2})", query, flags=re.IGNORECASE)
+        if id_match:
+            return id_match.group(1).upper()
+
         match = re.search(r"\b([A-Za-z]{3}\d{2}_[A-Za-z]{3})\b", query)
-        if not match:
+        if match:
+            return match.group(1).upper()
+
+        relaxed_match = re.search(r"\b([A-Za-z]{3})[\s_-]?(\d{2})[\s_-]?([A-Za-z]{3})\b", query)
+        if not relaxed_match:
             return None
-        return match.group(1).upper()
+        return f"{relaxed_match.group(1).upper()}{relaxed_match.group(2)}_{relaxed_match.group(3).upper()}"
 
     def _extract_question_ref(self, query: str) -> str | None:
         """Extracts question reference token (supports `q` and `qq` ID forms)."""
-        id_match = re.search(r"\b[A-Za-z]{3}\d{2}_[A-Za-z]{3}_q{1,2}(\d{1,3}[a-z]?)\b", query, flags=re.IGNORECASE)
+        id_match = re.search(r"\b[A-Za-z]{3}\d{2}_[A-Za-z]{3}_q{1,2}(\d+(?:\.\d+)?[a-z]?)\b", query, flags=re.IGNORECASE)
         if id_match:
             return f"q{id_match.group(1).lower()}"
 
-        q_match = re.search(r"\bq(?:uestion)?\s*(\d{1,3}[a-z]?)\b", query, flags=re.IGNORECASE)
+        q_match = re.search(r"\bq(?:uestion)?\s*(\d+(?:\.\d+)?[a-z]?)\b", query, flags=re.IGNORECASE)
         if not q_match:
             return None
         return f"q{q_match.group(1).lower()}"
@@ -524,29 +685,32 @@ class ChatbotService:
 
     def _question_component(self, question_id: str) -> str | None:
         """Extracts question number/suffix component from variable ID."""
-        match = re.search(r"_q{1,2}(\d+[a-z]?)\b", question_id.lower())
+        match = re.search(r"_q{1,2}(\d+(?:\.\d+)?[a-z]?)\b", question_id.lower())
         if not match:
             return None
         return match.group(1)
 
     def _split_question_ref(self, question_ref: str) -> tuple[str, str] | None:
         """Splits normalized question ref into number/suffix tuple."""
-        match = re.match(r"^q(\d+)([a-z]?)$", question_ref.strip().lower())
+        match = re.match(r"^q(\d+(?:\.\d+)?)([a-z]?)$", question_ref.strip().lower())
         if not match:
             return None
         return self._normalize_question_number(match.group(1)), match.group(2)
 
     def _split_question_component(self, component: str) -> tuple[str, str] | None:
         """Splits extracted component into number/suffix tuple."""
-        match = re.match(r"^(\d+)([a-z]?)$", component.strip().lower())
+        match = re.match(r"^(\d+(?:\.\d+)?)([a-z]?)$", component.strip().lower())
         if not match:
             return None
         return self._normalize_question_number(match.group(1)), match.group(2)
 
     def _normalize_question_number(self, number: str) -> str:
         """Normalizes numeric component (e.g., strips leading zeros)."""
-        normalized = number.strip().lstrip("0")
-        return normalized or "0"
+        segments = [segment for segment in number.strip().split(".") if segment != ""]
+        if not segments:
+            return "0"
+        normalized_segments = [(segment.lstrip("0") or "0") for segment in segments]
+        return ".".join(normalized_segments)
 
     def _build_variant_map(self, records: list[QuestionRecord], ref_number: str) -> dict[str, list[QuestionRecord]]:
         """Groups matching records into variant buckets (`11a`, `11b`, etc.)."""
@@ -567,12 +731,13 @@ class ChatbotService:
         ordered_keys = sorted(variant_map.keys(), key=self._variant_sort_key)
         return {key: sorted(variant_map[key], key=self._record_sort_key) for key in ordered_keys}
 
-    def _variant_sort_key(self, key: str) -> tuple[int, str]:
+    def _variant_sort_key(self, key: str) -> tuple[tuple[int, ...], str]:
         """Defines deterministic variant sort order."""
-        match = re.match(r"^(\d+)([a-z]?)$", key.lower())
+        match = re.match(r"^(\d+(?:\.\d+)?)([a-z]?)$", key.lower())
         if not match:
-            return (10_000, key.lower())
-        return (int(match.group(1)), match.group(2))
+            return ((10_000,), key.lower())
+        numeric_parts = tuple(int(part) for part in match.group(1).split("."))
+        return (numeric_parts, match.group(2))
 
     def _record_sort_key(self, record: QuestionRecord) -> tuple[int, str]:
         """Prioritizes canonical IDs over alias IDs when selecting representative record."""
@@ -588,11 +753,21 @@ class ChatbotService:
     def _build_specific_variant_response(
         self,
         *,
+        query: str,
         survey_name: str,
         variant_key: str,
         records: list[QuestionRecord],
     ) -> ChatResponse:
         """Builds final answer for a specific variant, merging value-label aliases."""
+        requested_context_fields = self._extract_requested_context_fields(query)
+        if requested_context_fields:
+            return self._build_context_field_response(
+                survey_name=survey_name,
+                variant_key=variant_key,
+                records=records,
+                requested_fields=requested_context_fields,
+            )
+
         records_with_values = [record for record in records if record.value_labels]
         candidate_pool = records_with_values or records
         primary = sorted(candidate_pool, key=self._record_sort_key)[0]
@@ -623,7 +798,117 @@ class ChatbotService:
             lookup_mode="exact_id",
             variant_count=1,
             retrieval_mode="deterministic",
+            answer_mode="allowed_values",
+            needs_clarification=False,
         )
+
+    def _extract_requested_context_fields(self, query: str) -> list[str]:
+        """Extracts requested metadata fields (for example `position`, `label`) from query text."""
+        lowered = query.lower()
+        requested: list[str] = []
+
+        def add(field_name: str) -> None:
+            """Append a field name once while preserving query-order intent."""
+            if field_name not in requested:
+                requested.append(field_name)
+
+        if "measurement level" in lowered or "measurement label" in lowered:
+            add("measurement_level")
+        elif re.search(r"\bmeasurement\b", lowered):
+            add("measurement_level")
+
+        if re.search(r"\bposition\b", lowered):
+            add("position")
+        if re.search(r"\brole\b", lowered):
+            add("role")
+        if re.search(r"\bcolumn\s+width\b", lowered):
+            add("column_width")
+        if re.search(r"\balignment\b", lowered):
+            add("alignment")
+        if re.search(r"\bprint\s+format\b", lowered):
+            add("print_format")
+        if re.search(r"\bwrite\s+format\b", lowered):
+            add("write_format")
+        if re.search(r"\bmissing\s+values?\b", lowered):
+            add("missing_values")
+        if re.search(r"\b(variable|question id)\b", lowered):
+            add("variable")
+        if re.search(r"\blabel\b", lowered) and "measurement label" not in lowered:
+            add("label")
+
+        if not requested and "context" in lowered:
+            requested.extend(_DEFAULT_CONTEXT_FIELDS)
+        return requested
+
+    def _build_context_field_response(
+        self,
+        *,
+        survey_name: str,
+        variant_key: str,
+        records: list[QuestionRecord],
+        requested_fields: list[str],
+    ) -> ChatResponse:
+        """Builds exact context-field response for a resolved survey question variant."""
+        primary = sorted(records, key=self._record_sort_key)[0]
+        question_label = f"{survey_name} question {variant_key}"
+        lines = [f"For **{question_label}** (`{primary.question_id}`), the exact dictionary context is:"]
+
+        for field_name in requested_fields:
+            display = _CONTEXT_FIELD_DISPLAY.get(field_name, field_name.replace("_", " ").title())
+            value = self._resolve_context_field_value(records, field_name)
+            if value:
+                lines.append(f"- {display}: {value}")
+            else:
+                lines.append(f"- {display}: Not available in the current dictionary")
+
+        matched_ids = sorted({record.question_id for record in records})
+        if len(matched_ids) > 1:
+            ids_text = ", ".join(f"`{question_id}`" for question_id in matched_ids)
+            lines.append(f"Matched variable IDs: {ids_text}")
+
+        ranked_results = sorted(records, key=self._record_sort_key)[: CHAT_RULES.max_cards_display]
+        return ChatResponse(
+            answer="\n".join(lines),
+            ranked_results=ranked_results,
+            lookup_mode="exact_id",
+            variant_count=1,
+            retrieval_mode="deterministic",
+            answer_mode="metadata_lookup",
+            needs_clarification=False,
+        )
+
+    def _resolve_context_field_value(self, records: list[QuestionRecord], field_name: str) -> str:
+        """Returns stable context-field value across aliases for a specific question variant."""
+        values: list[str] = []
+        seen: set[str] = set()
+        for record in sorted(records, key=self._record_sort_key):
+            if field_name == "variable":
+                value = record.question_id.strip()
+            elif field_name == "label":
+                value = record.question_text.strip()
+            elif field_name == "measurement_level":
+                value = record.measurement_level.strip()
+            elif field_name == "role":
+                value = record.role.strip()
+            else:
+                context_fields = getattr(record, "context_fields", {}) or {}
+                if not isinstance(context_fields, dict):
+                    context_fields = {}
+                raw_value = context_fields.get(field_name, "")
+                value = str(raw_value).strip() if raw_value is not None else ""
+            if not value:
+                continue
+            key = value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            values.append(value)
+
+        if not values:
+            return ""
+        if len(values) == 1:
+            return values[0]
+        return " | ".join(values)
 
     def _merge_value_labels(self, records: list[QuestionRecord]) -> list[str]:
         """Deduplicates/merges formatted value labels across records."""

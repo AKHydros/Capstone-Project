@@ -138,6 +138,7 @@ These are Pydantic request/response models for API contracts.
 | Symbol | What It Does |
 |---|---|
 | `ExcelRepository.load_records()` | Reads Excel sheets, builds value-label mappings, and returns normalized `QuestionRecord` list. |
+| `_normalize_cell(value)` | Normalizes mixed Excel cell types into clean string values for context fields. |
 
 ## `src/backend/loaders/survey_prompt_loader.py`
 | Symbol | What It Does |
@@ -205,6 +206,7 @@ These are Pydantic request/response models for API contracts.
 | `HybridRetriever.build(records)` | Builds chunks + lexical + semantic retrievers from records. |
 | `HybridRetriever.search_with_details(...)` | Runs weighted lexical+semantic ranking, filtering, and returns diagnostics. |
 | `HybridRetriever.search(...)` | Convenience wrapper returning only ranked records. |
+| `HybridRetriever._exact_match_boosts(query)` | Adds deterministic score boosts for exact variable/question references in user queries. |
 
 ## `src/backend/retrieval/lexical.py`
 | Symbol | What It Does |
@@ -254,6 +256,9 @@ These are Pydantic request/response models for API contracts.
 | `ChatbotService.__post_init__()` | Initializes RAG behavior flags and answer cache from overrides/env. |
 | `ChatbotService.chat(...)` | Main chat pipeline: exact-ID lookup, allowed-values path, hybrid retrieval, LLM/deterministic answer selection, answer caching. |
 | `ChatbotService.answer_cache_stats()` | Returns answer cache usage counters. |
+| `ChatbotService._exact_lookup_cache_key(...)` | Builds deterministic cache keys for exact lookup responses. |
+| `ChatbotService._serialize_chat_response(...)` | Serializes `ChatResponse` payloads for in-memory cache storage. |
+| `ChatbotService._cached_chat_response(payload)` | Rehydrates cached chat payloads back into `ChatResponse` objects. |
 | `ChatbotService._should_use_llm(...)` | Applies RAG confidence/gap logic to decide if synthesis is needed. |
 | `ChatbotService._confidence_score(diagnostics)` | Converts retrieval diagnostics top score into bounded confidence. |
 | `ChatbotService._is_synthesis_intent(query)` | Detects explicit summarize/analysis intent in user query. |
@@ -274,6 +279,10 @@ These are Pydantic request/response models for API contracts.
 | `ChatbotService._record_sort_key(record)` | Prioritizes canonical IDs over alias IDs when selecting representative record. |
 | `ChatbotService._best_variant_record(records)` | Chooses best representative record for a variant bucket. |
 | `ChatbotService._build_specific_variant_response(...)` | Builds final answer for a specific variant, merging value-label aliases. |
+| `ChatbotService._extract_requested_context_fields(query)` | Detects requested dictionary context fields (for example `position`, `label`, `role`) from the query. |
+| `ChatbotService._extract_requested_context_fields.add(field_name)` | Nested helper that appends a context field once while preserving request order. |
+| `ChatbotService._build_context_field_response(...)` | Builds deterministic exact-value responses for requested context fields. |
+| `ChatbotService._resolve_context_field_value(records, field_name)` | Resolves stable context field values across canonical/alias records for a variant. |
 | `ChatbotService._merge_value_labels(records)` | Deduplicates/merges formatted value labels across records. |
 | `ChatbotService._hinted_question_ref_records(...)` | Uses docx-derived hints to improve question-reference retrieval fallback. |
 | `ChatbotService._format_value_labels(value_labels)` | Normalizes value-label formatting (including numeric cleanup). |

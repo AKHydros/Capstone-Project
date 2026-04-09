@@ -127,6 +127,42 @@ class RagUpgradeTests(unittest.TestCase):
         self.assertTrue(second.answer_cache_hit)
         self.assertEqual(llm.calls, 1)
 
+    def test_answer_cache_is_context_aware(self) -> None:
+        """Assert changing conversation context bypasses cached answers for the same query."""
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+            retriever = HybridRetriever.build(make_records())
+        llm = StubLlmClient()
+
+        with patch.dict(
+            os.environ,
+            {
+                "RAG_ENABLED": "true",
+                "RAG_CONFIDENCE_THRESHOLD": "0.95",
+                "RAG_SCORE_GAP_THRESHOLD": "0.5",
+                "RAG_ANSWER_CACHE_TTL": "600",
+            },
+            clear=False,
+        ):
+            service = ChatbotService(retriever=retriever, llm_client=llm)
+            first = service.chat(
+                "summarize annual household income",
+                survey_name="PMG22_WAI",
+                use_llm=True,
+                llm_provider="chatgpt",
+                conversation_context=[{"role": "user", "content": "First context"}],
+            )
+            second = service.chat(
+                "summarize annual household income",
+                survey_name="PMG22_WAI",
+                use_llm=True,
+                llm_provider="chatgpt",
+                conversation_context=[{"role": "user", "content": "Different context"}],
+            )
+
+        self.assertFalse(first.answer_cache_hit)
+        self.assertFalse(second.answer_cache_hit)
+        self.assertEqual(llm.calls, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

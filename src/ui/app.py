@@ -12,6 +12,7 @@ import streamlit as st
 from backend.api.client import ApiClient
 from backend.config import load_config
 from backend.services.bootstrap_service import BootstrapArtifacts, BootstrapService
+from ui.chat_utils import build_conversation_context, chat_history_markdown, citation_markers, confidence_badge
 from ui.style import apply_pmg_theme
 
 
@@ -53,8 +54,6 @@ def _init_state() -> None:
         st.session_state.llm_model = load_config().openai_chat_model
     if "input_method" not in st.session_state:
         st.session_state.input_method = "Document"
-    if "translation_method" not in st.session_state:
-        st.session_state.translation_method = "Built-in Dictionary"
     if "inference_max_length_enabled" not in st.session_state:
         st.session_state.inference_max_length_enabled = False
     if "inference_top_p_enabled" not in st.session_state:
@@ -71,6 +70,16 @@ def _init_state() -> None:
         st.session_state.show_admin_dashboard = False
     if "session_consent_applied" not in st.session_state:
         st.session_state.session_consent_applied = False
+    if "user_role" not in st.session_state:
+        st.session_state.user_role = "viewer"
+    if "survey_filter" not in st.session_state:
+        st.session_state.survey_filter = "All"
+    if "wave_filter" not in st.session_state:
+        st.session_state.wave_filter = "All"
+    if "topic_filter" not in st.session_state:
+        st.session_state.topic_filter = "All"
+    if "label_type_filter" not in st.session_state:
+        st.session_state.label_type_filter = "All"
 
 
 def _save_uploaded_files(uploads_dir: Path, uploaded_files: list[object] | None) -> int:
@@ -120,7 +129,6 @@ def _ensure_chat_session_enabled(client: ApiClient) -> None:
         st.session_state.consent_granted = True
         st.session_state.session_consent_applied = True
     except Exception:  # noqa: BLE001
-        # Best effort. If this fails, the router may still enforce consent.
         st.session_state.pending_toast = "Could not auto-enable chat session consent."
 
 
@@ -139,31 +147,129 @@ def _combine_starter_prompts(starter_prompts: list[str], top_questions: list[str
     return combined
 
 
-def _chat_history_text(history: list[dict[str, str]]) -> str:
+def _normalize_sidebar_options(values: list[str]) -> list[str]:
+    """Normalizes sidebar options into unique, sorted, non-empty strings."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in values:
+        value = str(raw or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return sorted(out)
+
+
+def _chat_history_text(history: list[dict[str, object]]) -> str:
     """Serializes chat history into plain-text transcript format."""
     lines: list[str] = []
     for msg in history:
-        role = msg.get("role", "unknown").upper()
-        content = msg.get("content", "").strip()
+        role = str(msg.get("role", "unknown")).upper()
+        if role == "ASSISTANT" and msg.get("question") and msg.get("answer"):
+            content = f"Question: {str(msg.get('question')).strip()}\\nAnswer: {str(msg.get('answer')).strip()}"
+        else:
+            content = str(msg.get("content", "")).strip()
         if not content:
             continue
         lines.append(f"{role}: {content}")
-    return "\n\n".join(lines) if lines else "No chat messages yet."
+    return "\\n\\n".join(lines) if lines else "No chat messages yet."
 
 
-def _render_admin_dashboard(client: ApiClient) -> None:
-    """Renders health, index, SLA, trace, and governance admin panels."""
+def _format_question_answer_block(question: str, answer: str) -> str:
+    """Formats assistant response with explicit Question then Answer sections."""
+    return f"**Question asked**\\n\\n{question}\\n\\n**Answer**\\n\\n{answer}"
+
+
+def _should_show_sample_cards(question: str, cards: list[dict[str, object]]) -> bool:
+    """Shows sample cards only when user intent implies examples/samples."""
+    if not cards:
+        return False
+    normalized = question.lower()
+    trigger_terms = (
+        "sample",
+        "example",
+        "examples",
+        "show cards",
+        "card",
+        "list options",
+        "show matches",
+    )
+    return any(term in normalized for term in trigger_terms)
+
+
+def _render_sample_cards(cards: list[dict[str, object]]) -> None:
+    """Renders compact tile-like cards for sample results."""
+    for idx, record in enumerate(cards[:6], start=1):
+        with st.container(border=True):
+            st.markdown(f"**{idx}. {record['question_id']}**")
+            st.write(record["question_text"])
+            st.caption(
+                f"Survey: {record['survey_name']} | Wave/Year: {record['wave_year']} | "
+                f"Measurement: {record['measurement_level']}"
+            )
+            st.caption(f"Topics: {', '.join(record['topic_labels'])}")
+
+
+def _fallback_reason_text(reason: str | None) -> str:
+    """Maps fallback reason codes to concise UI text."""
+    if not reason:
+        return ""
+    mapping = {
+        "llm_unavailable": "LLM unavailable",
+        "unsupported_provider": "Provider unsupported",
+        "safety_fallback": "Safety fallback",
+    }
+    return mapping.get(reason, reason.replace("_", " ").title())
+
+
+def _render_unanswered_analytics(client: ApiClient) -> None:
+    """Renders unanswered-query analytics table and summary."""
+    analytics = client.unanswered_analytics(limit=50)
+    counts = analytics.get("counts", {})
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("No Cards", int(counts.get("no_cards", 0)))
+    with c2:
+        st.metric("Clarifier Only", int(counts.get("clarifier_only", 0)))
+
+    recent = analytics.get("recent", [])
+    if recent:
+        st.markdown("##### Recent Unanswered")
+        st.dataframe(pd.DataFrame(recent), use_container_width=True)
+    else:
+        st.info("No unanswered-query records yet.")
+
+    top_patterns = analytics.get("top_patterns", [])
+    if top_patterns:
+        st.markdown("##### Top Unanswered Patterns")
+        st.dataframe(pd.DataFrame(top_patterns), use_container_width=True)
+
+
+def _render_admin_dashboard(client: ApiClient, user_role: str) -> None:
+    """Renders role-aware monitoring and admin controls."""
     st.markdown("### Admin & Monitoring Dashboard")
 
     st.markdown("#### System Health")
-    compliance = client.compliance_status()
     llm = client.llm_health()
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
         st.metric("LLM Status", llm.get("status", "Unknown"))
     with c2:
+        st.metric("Role", user_role.title())
+
+    st.markdown("#### Unanswered Query Analytics")
+    _render_unanswered_analytics(client)
+
+    if user_role != "admin":
+        st.caption("Analyst view: read-only monitoring features.")
+        return
+
+    st.markdown("#### Compliance")
+    compliance = client.compliance_status()
+    p1, p2 = st.columns(2)
+    with p1:
         st.metric("Consent Enforced", "Yes" if compliance.get("consent_enforced") else "No")
-    with c3:
+    with p2:
         st.metric("Policy Version", compliance.get("safety_policy_version", "v1"))
 
     st.markdown("#### RAG Index Health")
@@ -275,9 +381,21 @@ except Exception as exc:  # noqa: BLE001
 client = ApiClient(config=config, artifacts=artifacts)
 _ensure_chat_session_enabled(client)
 
+try:
+    me_payload = client.auth_me()
+    st.session_state.user_role = str(me_payload.get("role", "viewer"))
+except Exception:  # noqa: BLE001
+    st.session_state.user_role = "viewer"
+
 if st.session_state.pending_toast:
     st.toast(st.session_state.pending_toast)
     st.session_state.pending_toast = None
+
+user_role = st.session_state.user_role
+is_admin = user_role == "admin"
+can_dashboard = user_role in {"analyst", "admin"}
+can_export = user_role in {"analyst", "admin"}
+can_feedback = user_role in {"analyst", "admin"}
 
 cache_startup, cache_current, cache_action, cache_built = _cache_status_text(artifacts)
 llm_health = client.llm_health()
@@ -285,7 +403,7 @@ llm_status = llm_health.get("status", "Unknown")
 deployment_mode = "Remote API" if client.using_remote_api else "In-process API adapter"
 llm_badge = "🟢 Connected" if str(llm_status).lower() == "connected" else "🔴 Disconnected"
 
-header_logo_col, header_menu_col, header_title_col, header_dashboard_col = st.columns([1.1, 1.2, 4.5, 1.4])
+header_logo_col, header_menu_col, header_title_col, header_dashboard_col = st.columns([1.1, 1.35, 4.35, 1.2])
 with header_logo_col:
     logo_path = Path(__file__).parent / "assets" / "pmg_logo.png"
     if logo_path.exists():
@@ -297,22 +415,34 @@ with header_menu_col:
     with st.popover("Chat & System"):
         export_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         st.markdown("#### Chat Export")
-        st.download_button(
-            "Export Chat (.txt)",
-            data=_chat_history_text(st.session_state.chat_history),
-            file_name=f"chat_export_{export_ts}.txt",
-            mime="text/plain",
-            use_container_width=True,
-            key="export_chat_txt",
-        )
-        st.download_button(
-            "Export Chat (.json)",
-            data=json.dumps(st.session_state.chat_history, indent=2),
-            file_name=f"chat_export_{export_ts}.json",
-            mime="application/json",
-            use_container_width=True,
-            key="export_chat_json",
-        )
+        if can_export:
+            st.download_button(
+                "Export Chat (.txt)",
+                data=_chat_history_text(st.session_state.chat_history),
+                file_name=f"chat_export_{export_ts}.txt",
+                mime="text/plain",
+                use_container_width=True,
+                key="export_chat_txt",
+            )
+            st.download_button(
+                "Export Chat (.json)",
+                data=json.dumps(st.session_state.chat_history, indent=2),
+                file_name=f"chat_export_{export_ts}.json",
+                mime="application/json",
+                use_container_width=True,
+                key="export_chat_json",
+            )
+            st.download_button(
+                "Export Chat (.md)",
+                data=chat_history_markdown(st.session_state.chat_history),
+                file_name=f"chat_export_{export_ts}.md",
+                mime="text/markdown",
+                use_container_width=True,
+                key="export_chat_md",
+            )
+        else:
+            st.caption("Export is available for analyst/admin roles.")
+
         st.markdown("#### LLM Health")
         st.write(llm_badge)
         if llm_health.get("last_check_time"):
@@ -325,21 +455,27 @@ with header_menu_col:
         else:
             st.caption("In-process adapter means this UI runs backend logic locally without HTTP calls.")
 
+        st.markdown("#### Role")
+        st.write(f"**{user_role.title()}**")
+
         st.markdown("#### Cache Controls")
         st.caption(f"Startup: {cache_startup} | Current: {cache_current} | Action: {cache_action}")
         st.caption(f"Last Build: {cache_built}")
-        if st.button("Force Rebuild Cache", use_container_width=True, key="menu_force_rebuild"):
-            _request_cache_action(
-                rebuild=True,
-                refresh_prompts=False,
-                toast_message="Cache rebuild requested.",
-            )
-        if st.button("Refresh Starter Prompts", use_container_width=True, key="menu_refresh_prompts"):
-            _request_cache_action(
-                rebuild=False,
-                refresh_prompts=True,
-                toast_message="Starter prompts refresh requested.",
-            )
+        if is_admin:
+            if st.button("Force Rebuild Cache", use_container_width=True, key="menu_force_rebuild"):
+                _request_cache_action(
+                    rebuild=True,
+                    refresh_prompts=False,
+                    toast_message="Cache rebuild requested.",
+                )
+            if st.button("Refresh Starter Prompts", use_container_width=True, key="menu_refresh_prompts"):
+                _request_cache_action(
+                    rebuild=False,
+                    refresh_prompts=True,
+                    toast_message="Starter prompts refresh requested.",
+                )
+        else:
+            st.caption("Cache actions are admin-only.")
 
 with header_title_col:
     st.title("Research Data Dictionary Chatbot")
@@ -348,8 +484,11 @@ with header_title_col:
 with header_dashboard_col:
     with st.container(border=True):
         st.markdown("###### Dashboard")
-        st.toggle("Admin & Monitoring", key="show_admin_dashboard")
-        st.caption("Admin View" if st.session_state.show_admin_dashboard else "Chat View")
+        if can_dashboard:
+            st.toggle("Admin & Monitoring", key="show_admin_dashboard")
+            st.caption("Admin View" if st.session_state.show_admin_dashboard else "Chat View")
+        else:
+            st.caption("Viewer mode")
 
 st.divider()
 
@@ -360,141 +499,180 @@ label_type_filter = "All"
 
 with st.sidebar:
     st.markdown("### Controls")
+    st.caption(f"Role: {user_role.title()}")
 
-    with st.expander("Add Files", expanded=False):
-        uploaded_files = st.file_uploader(
-            "Upload additional .xlsx or .docx files",
-            type=["xlsx", "docx"],
-            accept_multiple_files=True,
-            key="sidebar_uploader",
-        )
-        if st.button("Add Uploaded Files", use_container_width=True, key="sidebar_add_files"):
-            saved_count = _save_uploaded_files(uploads_dir, uploaded_files)
-            if saved_count > 0:
-                _request_cache_action(
-                    rebuild=True,
-                    refresh_prompts=True,
-                    toast_message=f"Added {saved_count} file(s). Cache and prompts refreshed.",
-                )
-            else:
-                st.toast("No files selected.")
-
-    with st.expander("Utilities", expanded=False):
-        st.session_state.llm_provider = st.selectbox(
-            "LLM Provider",
-            options=["chatgpt"],
-            format_func=lambda x: "ChatGPT (OpenAI)",
-            index=0,
-        )
-
-        chatgpt_models = list(config.openai_chat_models)
-        if not chatgpt_models:
-            chatgpt_models = [config.openai_chat_model]
-        if st.session_state.llm_model not in chatgpt_models:
-            st.session_state.llm_model = chatgpt_models[0]
-        st.session_state.llm_model = st.selectbox(
-            "ChatGPT Model",
-            options=chatgpt_models,
-            index=chatgpt_models.index(st.session_state.llm_model),
-        )
-
-    with st.expander("Inference Parameters", expanded=False):
-        st.session_state.inference_max_length_enabled = st.toggle(
-            "Max Length",
-            value=st.session_state.inference_max_length_enabled,
-        )
-        st.session_state.inference_max_length = int(
-            st.number_input(
-                "Max Length (tokens)",
-                min_value=64,
-                max_value=8192,
-                step=64,
-                value=int(st.session_state.inference_max_length),
-                disabled=not st.session_state.inference_max_length_enabled,
+    if is_admin:
+        with st.expander("Add Files", expanded=False):
+            uploaded_files = st.file_uploader(
+                "Upload additional .xlsx or .docx files",
+                type=["xlsx", "docx"],
+                accept_multiple_files=True,
+                key="sidebar_uploader",
             )
-        )
+            if st.button("Add Uploaded Files", use_container_width=True, key="sidebar_add_files"):
+                saved_count = _save_uploaded_files(uploads_dir, uploaded_files)
+                if saved_count > 0:
+                    _request_cache_action(
+                        rebuild=True,
+                        refresh_prompts=True,
+                        toast_message=f"Added {saved_count} file(s). Cache and prompts refreshed.",
+                    )
+                else:
+                    st.toast("No files selected.")
 
-        st.session_state.inference_top_p_enabled = st.toggle(
-            "Top p",
-            value=st.session_state.inference_top_p_enabled,
-        )
-        st.session_state.inference_top_p = st.slider(
-            "Top p value",
-            min_value=0.0,
-            max_value=1.0,
-            step=0.01,
-            value=float(st.session_state.inference_top_p),
-            disabled=not st.session_state.inference_top_p_enabled,
-        )
+    if user_role in {"analyst", "admin"}:
+        with st.expander("Utilities", expanded=False):
+            st.session_state.llm_provider = st.selectbox(
+                "LLM Provider",
+                options=["chatgpt"],
+                format_func=lambda x: "ChatGPT (OpenAI)",
+                index=0,
+            )
 
-        st.session_state.inference_temperature_enabled = st.toggle(
-            "Temperature",
-            value=st.session_state.inference_temperature_enabled,
-        )
-        st.session_state.inference_temperature = st.slider(
-            "Temperature value",
-            min_value=0.0,
-            max_value=2.0,
-            step=0.05,
-            value=float(st.session_state.inference_temperature),
-            disabled=not st.session_state.inference_temperature_enabled,
-        )
+            chatgpt_models = list(config.openai_chat_models)
+            if not chatgpt_models:
+                chatgpt_models = [config.openai_chat_model]
+            if st.session_state.llm_model not in chatgpt_models:
+                st.session_state.llm_model = chatgpt_models[0]
+            st.session_state.llm_model = st.selectbox(
+                "ChatGPT Model",
+                options=chatgpt_models,
+                index=chatgpt_models.index(st.session_state.llm_model),
+            )
 
-    with st.expander("Input Method", expanded=False):
-        input_methods = ["Document", "Webpage", "Audio", "Image", "PPT"]
-        if st.session_state.input_method not in input_methods:
+        with st.expander("Inference Parameters", expanded=False):
+            st.session_state.inference_max_length = max(64, min(8192, int(st.session_state.inference_max_length)))
+            st.session_state.inference_top_p = max(0.0, min(1.0, float(st.session_state.inference_top_p)))
+            st.session_state.inference_temperature = max(0.0, min(2.0, float(st.session_state.inference_temperature)))
+            st.session_state.inference_max_length_enabled = st.toggle(
+                "Max Length",
+                value=st.session_state.inference_max_length_enabled,
+            )
+            st.session_state.inference_max_length = int(
+                st.number_input(
+                    "Max Length (tokens)",
+                    min_value=64,
+                    max_value=8192,
+                    step=64,
+                    value=int(st.session_state.inference_max_length),
+                    disabled=not st.session_state.inference_max_length_enabled,
+                )
+            )
+
+            st.session_state.inference_top_p_enabled = st.toggle(
+                "Top p",
+                value=st.session_state.inference_top_p_enabled,
+            )
+            st.session_state.inference_top_p = st.slider(
+                "Top p value",
+                min_value=0.0,
+                max_value=1.0,
+                step=0.01,
+                value=float(st.session_state.inference_top_p),
+                disabled=not st.session_state.inference_top_p_enabled,
+            )
+
+            st.session_state.inference_temperature_enabled = st.toggle(
+                "Temperature",
+                value=st.session_state.inference_temperature_enabled,
+            )
+            st.session_state.inference_temperature = st.slider(
+                "Temperature value",
+                min_value=0.0,
+                max_value=2.0,
+                step=0.05,
+                value=float(st.session_state.inference_temperature),
+                disabled=not st.session_state.inference_temperature_enabled,
+            )
+            if st.session_state.inference_max_length_enabled:
+                st.caption(f"Active max output tokens: {int(st.session_state.inference_max_length)}")
+            else:
+                st.caption("Active max output tokens: model default")
+
+        with st.expander("Input Method", expanded=False):
             st.session_state.input_method = "Document"
-        st.session_state.input_method = st.radio(
-            "Choose Input Method",
-            options=input_methods,
-            index=input_methods.index(st.session_state.input_method),
-        )
+            st.selectbox(
+                "Choose Input Method",
+                options=["Document"],
+                index=0,
+                disabled=True,
+            )
+            st.caption("Webpage/Audio/Image/PPT modes are deprecated until dedicated ingestion pipelines are implemented.")
 
-    with st.expander("Translation Method", expanded=False):
-        st.session_state.translation_method = st.selectbox(
-            "Method",
-            options=["Built-in Dictionary"],
-            index=0,
-        )
-        st.session_state.language = st.selectbox(
-            "Language",
-            options=["en", "fr"],
-            format_func=lambda x: "English" if x == "en" else "Francais",
-            index=0 if st.session_state.language == "en" else 1,
-        )
+        with st.expander("Translation Method", expanded=False):
+            language_options = ["en", "fr"]
+            if st.session_state.language not in language_options:
+                st.session_state.language = "en"
+            st.session_state.language = st.selectbox(
+                "Language",
+                options=language_options,
+                format_func=lambda x: "English" if x == "en" else "Francais",
+                index=0 if st.session_state.language == "en" else 1,
+            )
+            st.caption("Translation uses the built-in dictionary pipeline.")
 
     with st.expander("Route Type", expanded=True):
-        st.session_state.router_mode = st.selectbox(
-            "Route",
-            options=["hybrid", "llm", "deterministic"],
-            index=["hybrid", "llm", "deterministic"].index(st.session_state.router_mode),
-        )
-        st.caption("Dynamic Filter Toggles")
-        survey_filter = st.selectbox("Survey", options=["All"] + artifacts.surveys, index=0)
-        wave_filter = st.selectbox("Wave/Year", options=["All"] + artifacts.waves, index=0)
-        topic_filter = st.selectbox("Topic Label", options=["All"] + artifacts.topics, index=0)
-        label_type_filter = st.selectbox("Label Type", options=["All"] + artifacts.topic_source_types, index=0)
+        route_options = ["hybrid", "llm", "deterministic"]
+        if user_role in {"analyst", "admin"}:
+            if st.session_state.router_mode not in route_options:
+                st.session_state.router_mode = "hybrid"
+            st.session_state.router_mode = st.selectbox(
+                "Route",
+                options=route_options,
+                index=route_options.index(st.session_state.router_mode),
+            )
+        else:
+            st.session_state.router_mode = "hybrid"
+            st.caption("Viewer role uses hybrid route mode.")
 
-    with st.expander("Cache Status & Actions", expanded=False):
+        survey_options = ["All", *_normalize_sidebar_options(artifacts.surveys)]
+        wave_options = ["All", *_normalize_sidebar_options(artifacts.waves)]
+        topic_options = ["All", *_normalize_sidebar_options(artifacts.topics)]
+        label_type_options = ["All", *_normalize_sidebar_options(artifacts.topic_source_types)]
+        if st.session_state.survey_filter not in survey_options:
+            st.session_state.survey_filter = "All"
+        if st.session_state.wave_filter not in wave_options:
+            st.session_state.wave_filter = "All"
+        if st.session_state.topic_filter not in topic_options:
+            st.session_state.topic_filter = "All"
+        if st.session_state.label_type_filter not in label_type_options:
+            st.session_state.label_type_filter = "All"
+
+        st.caption("Dynamic Filter Toggles")
+        survey_filter = st.selectbox("Survey", options=survey_options, index=survey_options.index(st.session_state.survey_filter))
+        st.session_state.survey_filter = survey_filter
+        wave_filter = st.selectbox("Wave/Year", options=wave_options, index=wave_options.index(st.session_state.wave_filter))
+        st.session_state.wave_filter = wave_filter
+        topic_filter = st.selectbox("Topic Label", options=topic_options, index=topic_options.index(st.session_state.topic_filter))
+        st.session_state.topic_filter = topic_filter
+        label_type_filter = st.selectbox(
+            "Label Type",
+            options=label_type_options,
+            index=label_type_options.index(st.session_state.label_type_filter),
+        )
+        st.session_state.label_type_filter = label_type_filter
+
+    with st.expander("Cache Status", expanded=False):
         st.caption(f"Startup: {cache_startup}")
         st.caption(f"Current: {cache_current}")
         st.caption(f"Action: {cache_action}")
         st.caption(f"Last Build: {cache_built}")
-        if st.button("Force Rebuild Cache", use_container_width=True, key="sidebar_force_rebuild"):
-            _request_cache_action(
-                rebuild=True,
-                refresh_prompts=False,
-                toast_message="Cache rebuild requested.",
-            )
-        if st.button("Refresh Starter Prompts", use_container_width=True, key="sidebar_refresh_prompts"):
-            _request_cache_action(
-                rebuild=False,
-                refresh_prompts=True,
-                toast_message="Starter prompts refresh requested.",
-            )
+        if is_admin:
+            if st.button("Force Rebuild Cache", use_container_width=True, key="sidebar_force_rebuild"):
+                _request_cache_action(
+                    rebuild=True,
+                    refresh_prompts=False,
+                    toast_message="Cache rebuild requested.",
+                )
+            if st.button("Refresh Starter Prompts", use_container_width=True, key="sidebar_refresh_prompts"):
+                _request_cache_action(
+                    rebuild=False,
+                    refresh_prompts=True,
+                    toast_message="Starter prompts refresh requested.",
+                )
 
-if st.session_state.show_admin_dashboard:
-    _render_admin_dashboard(client)
+if st.session_state.show_admin_dashboard and can_dashboard:
+    _render_admin_dashboard(client, user_role)
 else:
     library = client.question_library()
     top_questions = library.get("top_questions", [])
@@ -519,11 +697,80 @@ else:
         if not filtered_prompts:
             st.info("No prompts match your search.")
 
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if msg.get("meta"):
-                st.caption(msg["meta"])
+    for idx, msg in enumerate(st.session_state.chat_history):
+        with st.chat_message(str(msg.get("role", "assistant"))):
+            role = str(msg.get("role", "assistant"))
+            if role == "assistant" and msg.get("question") and msg.get("answer"):
+                st.markdown(_format_question_answer_block(str(msg.get("question")), str(msg.get("answer"))))
+            else:
+                st.markdown(str(msg.get("content", "")))
+
+            meta = str(msg.get("meta", "")).strip()
+            if meta:
+                st.caption(meta)
+
+            if role == "assistant":
+                confidence_value = msg.get("confidence_score")
+                if isinstance(confidence_value, (int, float)) or confidence_value is None:
+                    st.caption(confidence_badge(confidence_value if isinstance(confidence_value, (int, float)) else None))
+
+                fallback_reason = _fallback_reason_text(str(msg.get("fallback_reason"))) if msg.get("fallback_reason") else ""
+                if fallback_reason:
+                    st.caption(f"Fallback reason: {fallback_reason}")
+
+                sources = msg.get("sources", []) if isinstance(msg.get("sources", []), list) else []
+                if sources:
+                    markers = citation_markers(sources)
+                    if markers:
+                        st.caption(f"Citations: {markers}")
+                    with st.expander("Sources", expanded=False):
+                        for source in sources:
+                            if not isinstance(source, dict):
+                                continue
+                            st.markdown(
+                                f"{source.get('marker', '')} **{source.get('label', '')}**\\n\\n"
+                                f"{source.get('question_text', '')}"
+                            )
+
+                if can_feedback and msg.get("trace_id"):
+                    trace_id = str(msg.get("trace_id"))
+                    score = msg.get("feedback_score")
+                    if score in {-1, 1}:
+                        label = "Thumbs Up" if score == 1 else "Thumbs Down"
+                        st.caption(f"Feedback submitted: {label}")
+                    else:
+                        note_key = f"feedback_note_{trace_id}_{idx}"
+                        note_val = st.text_input("Feedback note (optional)", key=note_key)
+                        fb_col_up, fb_col_down = st.columns(2)
+                        with fb_col_up:
+                            if st.button("Thumbs Up", key=f"fb_up_{trace_id}_{idx}", use_container_width=True):
+                                client.submit_feedback(
+                                    session_id=st.session_state.session_id,
+                                    trace_id=trace_id,
+                                    score=1,
+                                    note=note_val,
+                                )
+                                msg["feedback_score"] = 1
+                                msg["feedback_note"] = note_val
+                                st.toast("Feedback saved.")
+                                st.rerun()
+                        with fb_col_down:
+                            if st.button("Thumbs Down", key=f"fb_down_{trace_id}_{idx}", use_container_width=True):
+                                client.submit_feedback(
+                                    session_id=st.session_state.session_id,
+                                    trace_id=trace_id,
+                                    score=-1,
+                                    note=note_val,
+                                )
+                                msg["feedback_score"] = -1
+                                msg["feedback_note"] = note_val
+                                st.toast("Feedback saved.")
+                                st.rerun()
+
+                cards = msg.get("cards", []) if isinstance(msg.get("cards", []), list) else []
+                if cards:
+                    st.markdown("#### Sample Answer Cards")
+                    _render_sample_cards(cards)
 
     prompt = st.chat_input("Ask about variables, labels, mappings, and trends")
     if not prompt and st.session_state.prefill_prompt:
@@ -531,7 +778,12 @@ else:
         st.session_state.prefill_prompt = ""
 
     if prompt:
+        conversation_context = build_conversation_context(
+            st.session_state.chat_history,
+            max_turns=config.conversation_memory_turns,
+        )
         st.session_state.chat_history.append({"role": "user", "content": prompt})
+
         filters = {
             "survey_name": None if survey_filter == "All" else survey_filter,
             "wave_year": None if wave_filter == "All" else wave_filter,
@@ -545,6 +797,7 @@ else:
             inference_settings["top_p"] = float(st.session_state.inference_top_p)
         if st.session_state.inference_temperature_enabled:
             inference_settings["temperature"] = float(st.session_state.inference_temperature)
+
         try:
             result = client.agent_router(
                 session_id=st.session_state.session_id,
@@ -556,37 +809,78 @@ else:
                 llm_model=st.session_state.llm_model,
                 inference=inference_settings,
                 input_method=st.session_state.input_method.lower(),
+                conversation_context=conversation_context,
             )
         except Exception as exc:  # noqa: BLE001
             st.error(f"Agent router failed: {exc}")
         else:
             trace_id = result.get("trace_id", "")
             route_used = result.get("route_used", "unknown")
-            fallback_used = result.get("fallback_used", False)
+            fallback_used = bool(result.get("fallback_used", False))
             latency_ms = result.get("latency_ms", 0.0)
-            answer = result.get("response", "")
+            answer = str(result.get("response", ""))
+            cards = result.get("cards", [])
+            sources = result.get("sources", [])
+            confidence_score = result.get("confidence_score")
+            fallback_reason = result.get("fallback_reason")
+            answer_mode = str(result.get("answer_mode", "direct_answer"))
+            needs_clarification = bool(result.get("needs_clarification", False))
+            unanswered_reason = result.get("unanswered_reason")
+
+            fallback_reason_text = _fallback_reason_text(str(fallback_reason)) if fallback_reason else ""
+            meta = (
+                f"route={route_used} | fallback={fallback_used} | latency={latency_ms}ms | "
+                f"trace_id={trace_id} | mode={answer_mode}"
+            )
+            if needs_clarification:
+                meta += " | clarification_required=true"
+            if unanswered_reason:
+                meta += f" | unanswered={unanswered_reason}"
+
+            show_sample_cards = _should_show_sample_cards(prompt, cards)
+            message_cards = cards if show_sample_cards and isinstance(cards, list) else []
 
             with st.chat_message("assistant"):
-                st.markdown(answer)
-                st.caption(f"route={route_used} | fallback={fallback_used} | latency={latency_ms}ms | trace_id={trace_id}")
-                cards = result.get("cards", [])
-                if cards:
-                    st.markdown("#### Retrieved Question Cards")
-                    for idx, record in enumerate(cards, start=1):
-                        with st.expander(f"{idx}. {record['question_id']} | {record['question_text'][:90]}"):
-                            st.write(f"**Question ID:** {record['question_id']}")
-                            st.write(f"**Question Text:** {record['question_text']}")
-                            st.write(f"**Survey:** {record['survey_name']}")
-                            st.write(f"**Wave/Year:** {record['wave_year']}")
-                            st.write(f"**Topic Labels:** {', '.join(record['topic_labels'])}")
-                            st.write(f"**Label Sources:** {record['topic_label_sources']}")
-                            st.write(f"**Measurement Level:** {record['measurement_level']}")
-                            st.write(f"**Source File:** {record['source_file']}")
+                st.markdown(_format_question_answer_block(prompt, answer))
+                st.caption(meta)
+                if isinstance(confidence_score, (int, float)):
+                    st.caption(confidence_badge(float(confidence_score)))
+                else:
+                    st.caption(confidence_badge(None))
+                if fallback_reason_text:
+                    st.caption(f"Fallback reason: {fallback_reason_text}")
+
+                if isinstance(sources, list) and sources:
+                    marker_text = citation_markers(sources)
+                    if marker_text:
+                        st.caption(f"Citations: {marker_text}")
+                    with st.expander("Sources", expanded=False):
+                        for source in sources:
+                            if not isinstance(source, dict):
+                                continue
+                            st.markdown(
+                                f"{source.get('marker', '')} **{source.get('label', '')}**\\n\\n"
+                                f"{source.get('question_text', '')}"
+                            )
+
+                if message_cards:
+                    st.markdown("#### Sample Answer Cards")
+                    _render_sample_cards(message_cards)
 
             st.session_state.chat_history.append(
                 {
                     "role": "assistant",
                     "content": answer,
-                    "meta": f"route={route_used} | fallback={fallback_used} | latency={latency_ms}ms | trace_id={trace_id}",
+                    "question": prompt,
+                    "answer": answer,
+                    "cards": message_cards,
+                    "sources": sources if isinstance(sources, list) else [],
+                    "trace_id": trace_id,
+                    "answer_mode": answer_mode,
+                    "needs_clarification": needs_clarification,
+                    "unanswered_reason": unanswered_reason,
+                    "confidence_score": confidence_score,
+                    "fallback_reason": fallback_reason,
+                    "meta": meta,
                 }
             )

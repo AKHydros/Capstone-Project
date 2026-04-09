@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -15,6 +15,7 @@ class QuestionRecord:
     value_labels: list[str]
     topic_labels: list[str]
     topic_label_sources: dict[str, str]
+    context_fields: dict[str, str] = field(default_factory=dict)
 
     @property
     def value_labels_text(self) -> str:
@@ -56,6 +57,8 @@ class ChatResponse:
     lookup_mode: str = "hybrid_fallback"
     variant_count: int = 0
     retrieval_mode: str = "deterministic"
+    answer_mode: str = "direct_answer"
+    needs_clarification: bool = False
     confidence_score: float | None = None
     embedding_cache_hit: bool = False
     answer_cache_hit: bool = False

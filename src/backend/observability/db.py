@@ -126,6 +126,26 @@ class ObservabilityStore:
                     total_queries INTEGER
                 );
 
+                CREATE TABLE IF NOT EXISTS response_feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trace_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    user_role TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    note TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS unanswered_queries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trace_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    user_role TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    query_text TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
                 CREATE INDEX IF NOT EXISTS idx_events_trace_id ON events(trace_id);
                 CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
@@ -139,6 +159,10 @@ class ObservabilityStore:
                 CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
                 CREATE INDEX IF NOT EXISTS idx_sessions_completion_status ON sessions(completion_status);
                 CREATE INDEX IF NOT EXISTS idx_governance_status_updated ON governance_items(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_feedback_trace_id ON response_feedback(trace_id);
+                CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON response_feedback(created_at);
+                CREATE INDEX IF NOT EXISTS idx_unanswered_reason ON unanswered_queries(reason);
+                CREATE INDEX IF NOT EXISTS idx_unanswered_created_at ON unanswered_queries(created_at);
                 """
             )
             conn.commit()
@@ -315,6 +339,108 @@ class ObservabilityStore:
             )
             conn.commit()
             return int(cur.lastrowid)
+
+    def record_feedback(
+        self,
+        *,
+        trace_id: str,
+        session_id: str,
+        user_role: str,
+        score: int,
+        note: str | None,
+    ) -> int:
+        """Persists per-response feedback (thumbs + optional note)."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO response_feedback(trace_id, session_id, user_role, score, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (trace_id, session_id, user_role, int(score), (note or "").strip() or None, _now()),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def recent_feedback(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Returns recent feedback records for operator review."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM response_feedback ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_unanswered(
+        self,
+        *,
+        trace_id: str,
+        session_id: str,
+        user_role: str,
+        reason: str,
+        query_text: str,
+    ) -> int:
+        """Stores unanswered-query classification for analytics."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO unanswered_queries(trace_id, session_id, user_role, reason, query_text, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (trace_id, session_id, user_role, reason, query_text, _now()),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def unanswered_analytics(self, limit: int = 25) -> dict[str, Any]:
+        """Returns aggregate unanswered counts, recent examples, and top repeated patterns."""
+        with self._connect() as conn:
+            reason_rows = conn.execute(
+                "SELECT reason, COUNT(*) as c FROM unanswered_queries GROUP BY reason"
+            ).fetchall()
+            recent_rows = conn.execute(
+                """
+                SELECT trace_id, session_id, user_role, reason, query_text, created_at
+                FROM unanswered_queries
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            top_pattern_rows = conn.execute(
+                """
+                SELECT LOWER(TRIM(query_text)) as query_pattern, COUNT(*) as c
+                FROM unanswered_queries
+                GROUP BY LOWER(TRIM(query_text))
+                ORDER BY c DESC, query_pattern ASC
+                LIMIT 10
+                """
+            ).fetchall()
+
+        counts = {"no_cards": 0, "clarifier_only": 0}
+        for row in reason_rows:
+            reason = str(row["reason"])
+            counts[reason] = int(row["c"])
+
+        recent = [
+            {
+                "trace_id": str(row["trace_id"]),
+                "session_id": str(row["session_id"]),
+                "user_role": str(row["user_role"]),
+                "reason": str(row["reason"]),
+                "query_text": str(row["query_text"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in recent_rows
+        ]
+        top_patterns = [
+            {
+                "query_pattern": str(row["query_pattern"] or ""),
+                "count": int(row["c"]),
+            }
+            for row in top_pattern_rows
+            if str(row["query_pattern"] or "").strip()
+        ]
+        return {"counts": counts, "recent": recent, "top_patterns": top_patterns}
 
     def upsert_governance_item(
         self,

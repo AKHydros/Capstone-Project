@@ -17,9 +17,13 @@ class AppConfig:
     observability_db_path: Path
     logs_dir: Path
     api_internal_token: str
+    api_viewer_tokens: tuple[str, ...]
+    api_analyst_tokens: tuple[str, ...]
+    api_admin_tokens: tuple[str, ...]
     api_base_url: str
     governance_policy_version: str
     default_router_mode: str
+    conversation_memory_turns: int
     openai_chat_model: str
     openai_chat_models: tuple[str, ...]
     rag_enabled: bool
@@ -48,6 +52,32 @@ def _parse_bool_env(raw: str | None, *, default: bool) -> bool:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _parse_int_env(raw: str | None, *, default: int) -> int:
+    """Parses integer-like env strings with fallback."""
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def resolve_api_role(config: AppConfig, token: str | None) -> str | None:
+    """Resolves API role for a token (`viewer`/`analyst`/`admin`) or `None`."""
+    normalized = (token or "").strip()
+    if not normalized:
+        return None
+    if normalized == config.api_internal_token:
+        return "admin"
+    if normalized in config.api_admin_tokens:
+        return "admin"
+    if normalized in config.api_analyst_tokens:
+        return "analyst"
+    if normalized in config.api_viewer_tokens:
+        return "viewer"
+    return None
+
 @lru_cache(maxsize=1)
 def load_config() -> AppConfig:
     """Loads all runtime configuration from environment variables (memoized)."""
@@ -68,9 +98,16 @@ def load_config() -> AppConfig:
         "data/logs",
     )
     api_internal_token = os.getenv("API_INTERNAL_TOKEN", "dev-internal-token")
+    api_viewer_tokens = _parse_csv_env(os.getenv("API_VIEWER_TOKENS", "").strip())
+    api_analyst_tokens = _parse_csv_env(os.getenv("API_ANALYST_TOKENS", "").strip())
+    api_admin_tokens = _parse_csv_env(os.getenv("API_ADMIN_TOKENS", "").strip())
     api_base_url = os.getenv("API_BASE_URL", "").strip()
     governance_policy_version = os.getenv("GOVERNANCE_POLICY_VERSION", "v1")
     default_router_mode = os.getenv("DEFAULT_ROUTER_MODE", "hybrid").strip().lower()
+    conversation_memory_turns = max(
+        1,
+        _parse_int_env(os.getenv("CONVERSATION_MEMORY_TURNS"), default=20),
+    )
     openai_chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
     openai_chat_models_raw = os.getenv("OPENAI_CHAT_MODELS", "").strip()
     openai_chat_models = _parse_csv_env(openai_chat_models_raw) if openai_chat_models_raw else (openai_chat_model,)
@@ -89,9 +126,13 @@ def load_config() -> AppConfig:
         observability_db_path=Path(observability_db),
         logs_dir=Path(logs_dir),
         api_internal_token=api_internal_token,
+        api_viewer_tokens=api_viewer_tokens,
+        api_analyst_tokens=api_analyst_tokens,
+        api_admin_tokens=api_admin_tokens,
         api_base_url=api_base_url,
         governance_policy_version=governance_policy_version,
         default_router_mode=default_router_mode,
+        conversation_memory_turns=conversation_memory_turns,
         openai_chat_model=openai_chat_model,
         openai_chat_models=openai_chat_models,
         rag_enabled=rag_enabled,

@@ -9,7 +9,7 @@ import time
 from ..retrieval.hybrid import HybridRetriever
 
 
-CACHE_SCHEMA_VERSION = "v4"
+CACHE_SCHEMA_VERSION = "v5"
 
 
 @dataclass(frozen=True)

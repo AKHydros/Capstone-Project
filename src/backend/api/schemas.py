@@ -3,6 +3,11 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class ConversationTurn(BaseModel):
+    role: str
+    content: str
+
+
 class RouterFilters(BaseModel):
     survey_name: str | None = None
     wave_year: str | None = None
@@ -27,6 +32,7 @@ class AgentRouterRequest(BaseModel):
     llm_model: str | None = None
     inference: InferenceSettings = Field(default_factory=InferenceSettings)
     input_method: str = "document"
+    conversation_context: list[ConversationTurn] = Field(default_factory=list)
 
 
 class ResultCardResponse(BaseModel):
@@ -38,6 +44,16 @@ class ResultCardResponse(BaseModel):
     topic_label_sources: dict[str, str]
     measurement_level: str
     source_file: str
+
+
+class CitationSourceResponse(BaseModel):
+    index: int
+    marker: str
+    label: str
+    question_id: str
+    survey_name: str
+    wave_year: str
+    question_text: str
 
 
 class AgentRouterResponse(BaseModel):
@@ -53,6 +69,11 @@ class AgentRouterResponse(BaseModel):
     takeaways: list[str]
     latency_ms: float
     cards: list[ResultCardResponse]
+    sources: list[CitationSourceResponse] = Field(default_factory=list)
+    answer_mode: str = "direct_answer"
+    needs_clarification: bool = False
+    unanswered_reason: str | None = None
+    fallback_reason: str | None = None
 
 
 class ConsentRecordRequest(BaseModel):
@@ -100,3 +121,25 @@ class IndexHealthResponse(BaseModel):
 class ReindexResponse(BaseModel):
     ok: bool
     index_health: IndexHealthResponse
+
+
+class FeedbackRequest(BaseModel):
+    session_id: str
+    trace_id: str
+    score: int = Field(ge=-1, le=1)
+    note: str | None = None
+
+
+class FeedbackResponse(BaseModel):
+    feedback_id: int
+    stored: bool
+
+
+class UnansweredAnalyticsResponse(BaseModel):
+    counts: dict[str, int]
+    recent: list[dict[str, str]]
+    top_patterns: list[dict[str, int | str]]
+
+
+class AuthMeResponse(BaseModel):
+    role: str

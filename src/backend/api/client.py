@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 import httpx
 
-from ..config import AppConfig
+from ..config import AppConfig, resolve_api_role
 from ..services.agent_router_service import AgentRouterInput
 from ..services.bootstrap_service import BootstrapArtifacts
 
@@ -17,6 +17,7 @@ class ApiClient:
         self.config = config
         self.artifacts = artifacts
         self.base_url = config.api_base_url.rstrip("/")
+        self.user_role = resolve_api_role(config, config.api_internal_token) or "viewer"
 
     @property
     def using_remote_api(self) -> bool:
@@ -35,6 +36,7 @@ class ApiClient:
         llm_model: str | None = None,
         inference: dict[str, int | float] | None = None,
         input_method: str = "document",
+        conversation_context: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Calls `/api/agent-router` remotely or local router fallback."""
         payload = {
@@ -47,6 +49,7 @@ class ApiClient:
             "llm_model": llm_model,
             "inference": inference or {},
             "input_method": input_method,
+            "conversation_context": conversation_context or [],
         }
         return self._remote_or_fallback(
             lambda: self._post_json("/api/agent-router", payload),
@@ -60,7 +63,15 @@ class ApiClient:
                 llm_model=llm_model,
                 inference=inference or {},
                 input_method=input_method,
+                conversation_context=conversation_context or [],
             ),
+        )
+
+    def auth_me(self) -> dict[str, Any]:
+        """Returns resolved role for current token."""
+        return self._remote_or_fallback(
+            lambda: self._get_json("/api/auth/me"),
+            lambda: {"role": self.user_role},
         )
 
     def compliance_status(self) -> dict[str, Any]:
@@ -158,6 +169,42 @@ class ApiClient:
             lambda: self._local_rebuild_index(refresh_prompts=refresh_prompts),
         )
 
+    def submit_feedback(
+        self,
+        *,
+        session_id: str,
+        trace_id: str,
+        score: int,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Submits thumbs-style feedback for an assistant response."""
+        payload = {
+            "session_id": session_id,
+            "trace_id": trace_id,
+            "score": int(score),
+            "note": note,
+        }
+        return self._remote_or_fallback(
+            lambda: self._post_json("/api/feedback", payload),
+            lambda: {
+                "feedback_id": self.artifacts.observability_store.record_feedback(
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    user_role=self.user_role,
+                    score=int(score),
+                    note=note,
+                ),
+                "stored": True,
+            },
+        )
+
+    def unanswered_analytics(self, *, limit: int = 25) -> dict[str, Any]:
+        """Returns unanswered-query analytics payload."""
+        return self._remote_or_fallback(
+            lambda: self._get_json("/api/analytics/unanswered", params={"limit": limit}),
+            lambda: self.artifacts.observability_store.unanswered_analytics(limit=limit),
+        )
+
     def _local_agent_router(
         self,
         *,
@@ -170,6 +217,7 @@ class ApiClient:
         llm_model: str | None,
         inference: dict[str, int | float],
         input_method: str,
+        conversation_context: list[dict[str, str]],
     ) -> dict[str, Any]:
         """Local adapter call into `AgentRouterService.handle`."""
         output = self.artifacts.agent_router_service.handle(
@@ -183,6 +231,8 @@ class ApiClient:
                 llm_model=llm_model,
                 inference=inference,
                 input_method=input_method,
+                conversation_context=conversation_context,
+                user_role=self.user_role,
             )
         )
         return {
@@ -198,6 +248,11 @@ class ApiClient:
             "takeaways": output.takeaways,
             "latency_ms": output.latency_ms,
             "cards": [asdict(card) for card in output.cards],
+            "sources": [asdict(source) for source in output.sources],
+            "answer_mode": output.answer_mode,
+            "needs_clarification": output.needs_clarification,
+            "unanswered_reason": output.unanswered_reason,
+            "fallback_reason": output.fallback_reason,
         }
 
     def _local_compliance_status(self) -> dict[str, Any]:

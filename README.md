@@ -8,18 +8,18 @@ Research-first conversational assistant for PMG data dictionaries with grounded 
 
 | Area | Current state |
 |---|---|
-| Journey scope | Consent -> query -> grounded retrieval -> routed response -> governance/trace logging |
+| Journey scope | Session chat -> grounded retrieval -> routed response -> citations/feedback -> trace logging |
 | Architecture | Streamlit UI + FastAPI service + in-process adapter fallback |
 | Runtime | Python (`streamlit`, `fastapi`, `uvicorn`) |
 | Observability | SQLite telemetry, JSONL events, trace IDs, SLA snapshots |
-| Test status (Mar 31, 2026) | No automated test suite committed in this repo |
+| Test status (Apr 8, 2026) | Unit test suite committed and passing in project venv |
 
 ---
 
 ## Why This Exists
 
 Research dictionary workflows become slow when users need to manually scan large spreadsheets, reconcile survey waves, and validate topic mappings without clear traceability.
-This project reduces that friction by combining deterministic retrieval and filtering with optional LLM summarization, then wrapping the flow with consent controls, governance labeling, and auditable telemetry.
+This project reduces that friction by combining deterministic retrieval and filtering with optional LLM summarization, then wrapping the flow with source citations, role-aware controls, and auditable telemetry.
 
 Primary users:
 - **Research teams:** quickly locate grounded variables/labels across surveys and waves.
@@ -40,11 +40,11 @@ Primary users:
 
 - Consistent answers tied to source survey metadata (survey, wave, question ID, and labels).
 - Optional conversational summaries for executives and stakeholders who need quick interpretation.
-- Suggested follow-up prompts to accelerate exploratory analysis sessions.
+- Clarifier responses for ambiguous question variants (for example, `q5a` vs `q5b`) with direct next-step guidance.
 
 ### Governance and Compliance Confidence
 
-- Consent-first workflow that blocks processing until user consent is provided.
+- Session activation records and auditable role-tagged traces for each routed answer.
 - Safety checks on both user input and assistant output to reduce policy and reputational risk.
 - Governance lifecycle tracking (`Draft`, `Approved`, `Deprecated`) for institutional review workflows.
 
@@ -62,6 +62,23 @@ Primary users:
 
 ---
 
+## Conversational Upgrade Matrix (Apr 2026)
+
+| Feature | Status | Notes |
+|---|---|---|
+| Citations-first answers | Implemented | Ordered source markers (`[1]`, `[2]`) + expandable source panel |
+| Ambiguity clarifier | Implemented | Explicit clarifier mode for unresolved variants (`q5a` / `q5b`) |
+| Session conversation memory | Implemented | Last N turns (`CONVERSATION_MEMORY_TURNS`, default 20) sent per request |
+| Structured quick-answer modes | Implemented | `direct_answer`, `summary`, `allowed_values`, `metadata_lookup`, `clarifier` |
+| Confidence + fallback transparency | Implemented | Confidence buckets + fallback reason labels in UI |
+| Per-response feedback | Implemented | Thumbs up/down + optional note persisted by trace ID |
+| Role-based access control | Implemented | `viewer`, `analyst`, `admin` token-to-role mapping |
+| Evaluation harness | Implemented | Unit coverage under `tests/` including conversational regressions |
+| Unanswered-query analytics | Implemented | `no_cards` / `clarifier_only` tracking + dashboard summary |
+| One-click exports | Implemented | `.txt`, `.json`, `.md` chat export options |
+
+---
+
 ## Project Documents
 
 - Current implementation overview: this README.
@@ -74,11 +91,12 @@ Primary users:
 ## Product Demo Assets
 
 Recommended capture set for presentation/demo updates:
-- Consent capture and logging level confirmation
+- Conversational query with inline citations and expanded source panel
 - Route mode switching (`hybrid` / `llm` / `deterministic`)
-- Top 50 common question list + generated suggestions
-- Retrieved grounded question cards with trace metadata
-- Admin tab: LLM health, SLA KPIs, snapshots, governance lifecycle updates
+- Confidence/fallback status badges and reason labels
+- Feedback submission (thumbs + note) from assistant responses
+- Role-specific dashboard views (viewer/analyst/admin)
+- Unanswered-query analytics dashboard section
 
 Recommended folder: `assets/screenshots/`
 
@@ -184,17 +202,23 @@ Deterministic retrieval filters, consent enforcement, and observability records 
 
 - Hybrid router with explicit modes: `hybrid`, `llm`, `deterministic`
 - Automatic LLM fallback to deterministic mode when health is degraded
-- Consent gate before user content processing
+- Source citations derived from grounded cards and returned with each response
+- Session-only conversation context handoff (bounded turn window)
+- Answer mode metadata (`direct_answer`, `summary`, `allowed_values`, `metadata_lookup`, `clarifier`)
 - Deterministic safety checks with outbound-response validation and basic PII redaction
 - Grounded retrieval over Excel dictionary records (lexical + semantic weighted ranking)
 - Semantic retrieval supports OpenAI embeddings or local TF-IDF fallback
 - Starter prompt extraction from `.docx` survey files with cache signature checks
+- Question-reference hint extraction from `.docx` files for improved variant matching fallback
 - Upload pipeline for additional `.xlsx` and `.docx` assets via UI
-- Question library preload (top 50 + generated suggestions)
 - EN/FR translation utility with TTL cache
 - Query-result TTL cache in router for repeated requests
+- Feedback capture endpoint and trace-linked persistence (`thumbs +/- note`)
+- Unanswered-query classification (`no_cards`, `clarifier_only`) and analytics endpoint
+- Role-based API authorization via token-to-role mapping (`viewer`, `analyst`, `admin`)
 - Observability stack:
   - session, event, trace, and QA persistence in SQLite
+  - feedback and unanswered-query analytics persistence in SQLite
   - governance item lifecycle (`Draft`, `Approved`, `Deprecated`)
   - JSONL event stream in `data/logs/app_events.jsonl`
   - SLA metrics and monthly snapshots
@@ -207,17 +231,18 @@ Deterministic retrieval filters, consent enforcement, and observability records 
 
 ### Implemented
 
-- FastAPI endpoints for router, consent, compliance, metrics, trace explorer, governance, and question library
-- Streamlit chatbot experience with utility controls and admin/monitoring tab
+- FastAPI endpoints for router, role introspection, feedback ingestion, unanswered analytics, and admin operations
+- Streamlit chatbot experience with citations panel, confidence/fallback display, role-aware controls, and export menu
 - Bootstrap pipeline for index caching, prompt caching, observability wiring, and question library preload
 - Governance persistence and status updates from UI
 - Deterministic health signal for LLM availability (`Connected`/`Degraded`)
+ - Unit test coverage for chatbot routing/lookup behavior and conversational utility helpers
 
 ### In Progress / Next
 
 - Broader language support beyond EN/FR dictionary mapping
 - More complete safety policy coverage and nuanced redaction
-- Automated tests and CI validation for router and API contracts
+- CI workflow for automated test execution and deployment checks
 
 ---
 
@@ -325,10 +350,14 @@ Then route client traffic through NGINX to spread load and reduce tail latency d
 | `RAG_BATCH_REBUILD` | `true` | Persist rebuilt index to disk during startup rebuild flow |
 | `OBSERVABILITY_DB_PATH` | `data/observability.db` | SQLite store for sessions/events/traces/governance |
 | `LOGS_DIR` | `data/logs` | JSONL event log directory |
-| `API_INTERNAL_TOKEN` | `dev-internal-token` | Internal API auth token (`x-internal-token`) |
+| `API_INTERNAL_TOKEN` | `dev-internal-token` | Shared token (admin-compatible fallback) sent as `x-internal-token` |
+| `API_VIEWER_TOKENS` | empty | Comma-separated tokens mapped to `viewer` role |
+| `API_ANALYST_TOKENS` | empty | Comma-separated tokens mapped to `analyst` role |
+| `API_ADMIN_TOKENS` | empty | Comma-separated tokens mapped to `admin` role |
 | `API_BASE_URL` | empty | Remote API endpoint for UI client |
 | `GOVERNANCE_POLICY_VERSION` | `v1` | Policy version shown in compliance status |
 | `DEFAULT_ROUTER_MODE` | `hybrid` | Default routing mode if request mode is invalid |
+| `CONVERSATION_MEMORY_TURNS` | `20` | Number of recent turns included as session memory context |
 | `API_BIND` | `0.0.0.0:8000` | Gunicorn bind address for API process |
 | `API_WORKERS` | `2*CPU+1` | Gunicorn worker process count (capped by `API_MAX_WORKERS`) |
 | `API_MAX_WORKERS` | `2*CPU+1` | Upper bound for auto worker sizing |
@@ -347,14 +376,18 @@ Then route client traffic through NGINX to spread load and reduce tail latency d
 
 Auth and tracing notes:
 - All endpoints except `GET /api/health/llm` require header `x-internal-token`.
+- Role access is token-derived (`viewer`, `analyst`, `admin`) using `API_*_TOKENS` plus `API_INTERNAL_TOKEN` fallback.
 - Middleware injects `x-trace-id` and `x-latency-ms` response headers.
 
 ### Implemented Endpoints
 
 - `GET /api/health/llm` - LLM connectivity status (`Connected` or `Degraded`)
-- `POST /api/consent-record` - Persist consent decision and effective logging level
-- `GET /api/compliance-status` - Consent enforcement, policy version, governance counts, health summary
-- `POST /api/agent-router` - Main routed query endpoint returning response, labels, takeaways, cards, latency
+- `GET /api/auth/me` - Returns resolved role for the current token
+- `POST /api/consent-record` - Persist session activation/consent record
+- `GET /api/compliance-status` - Policy version, governance counts, and health summary (analyst/admin)
+- `POST /api/agent-router` - Main routed query endpoint with conversation context input and citations/answer-mode output
+- `POST /api/feedback` - Persist per-response thumbs feedback with optional note (analyst/admin)
+- `GET /api/analytics/unanswered` - Aggregated unanswered-query analytics and recent unresolved examples (analyst/admin)
 - `GET /api/index/health` - RAG index metadata (signature/version/doc+chunk counts/mode/cache hit rates)
 - `POST /api/index/rebuild` - Force index rebuild (optional prompt refresh) and return updated index health
 - `GET /api/metrics/sla` - P50/P95 latency, error/fallback rates, session completion, volume
@@ -362,7 +395,11 @@ Auth and tracing notes:
 - `GET /api/traces/{trace_id}` - Trace and most recent QA payload
 - `GET /api/governance-items` - Governance items and status counts
 - `POST /api/governance-items/{item_id}/status` - Update governance lifecycle state
-- `GET /api/question-library` - Top questions, generated suggestions, approved governance library
+- `GET /api/question-library` - Starter/top question library and approved governance items
+
+Router contract highlights:
+- `POST /api/agent-router` accepts optional `conversation_context` (list of `{role, content}` turns).
+- Router responses include `sources`, `answer_mode`, `needs_clarification`, `unanswered_reason`, and `fallback_reason` in addition to existing fields.
 
 ---
 
@@ -459,6 +496,7 @@ Tracked metrics include:
 │   │   └── models.py
 │   └── ui/
 │       ├── app.py
+│       ├── chat_utils.py
 │       └── style.py
 ├── pyproject.toml
 └── README.md
@@ -468,11 +506,10 @@ Tracked metrics include:
 
 ## Known Limitations
 
-- No committed automated tests yet (manual validation required).
 - LLM health checks only API key presence, not end-to-end provider latency/error classes.
 - Translation is dictionary-based and currently limited to EN/FR.
 - Safety screening uses a small deterministic phrase list; policy coverage is intentionally narrow.
-- Internal API auth is a static shared token model (not role-based auth).
+- Role auth is token-based only (no user directory/SSO integration).
 - Data persistence is local SQLite/JSONL, suitable for prototype workflows.
 
 ---
@@ -482,7 +519,7 @@ Tracked metrics include:
 ### `401 Invalid internal token`
 
 - Ensure requests include `x-internal-token`.
-- Confirm token value matches `API_INTERNAL_TOKEN` in your `.env`.
+- Confirm token value is present in one of: `API_INTERNAL_TOKEN`, `API_VIEWER_TOKENS`, `API_ANALYST_TOKENS`, `API_ADMIN_TOKENS`.
 
 ### UI shows `Startup failed: No valid Excel source files were found for ingestion.`
 
@@ -502,6 +539,16 @@ Tracked metrics include:
 ---
 
 ## Release Notes
+
+### 2026-04
+
+- Added conversation-context payload support (`conversation_context`) to router requests
+- Added citation source payloads, answer mode tags, clarification flags, fallback reason, and unanswered classification in router responses
+- Added role-aware API auth (`viewer` / `analyst` / `admin`) with token mapping and `/api/auth/me`
+- Added feedback ingestion endpoint (`/api/feedback`) and unanswered analytics endpoint (`/api/analytics/unanswered`)
+- Added Streamlit role-aware UX: citations panel, confidence/fallback display, markdown export, and per-answer feedback controls
+- Added unanswered-query analytics panel in dashboard
+- Added regression tests for conversational helpers, role mapping, and unanswered analytics
 
 ### 2026-03
 

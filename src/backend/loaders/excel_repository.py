@@ -32,9 +32,15 @@ class ExcelRepository:
             variable_info = variable_info.rename(
                 columns={
                     "Variable": "variable",
+                    "Position": "position",
                     "Label": "label",
                     "Measurement Level": "measurement_level",
                     "Role": "role",
+                    "Column Width": "column_width",
+                    "Alignment": "alignment",
+                    "Print Format": "print_format",
+                    "Write Format": "write_format",
+                    "Missing Values": "missing_values",
                 }
             )
             variable_values = variable_values.rename(
@@ -68,21 +74,46 @@ class ExcelRepository:
                 seen_question_ids.add(variable)
                 value_labels = value_map.get(variable, [])
                 topic_labels, topic_label_sources = categorize_question_labels(label, value_labels)
+                measurement_level = _normalize_cell(getattr(row, "measurement_level", "Unknown")) or "Unknown"
+                role = _normalize_cell(getattr(row, "role", "Unknown")) or "Unknown"
+                context_fields = {
+                    "variable": variable,
+                    "position": _normalize_cell(getattr(row, "position", "")),
+                    "label": label,
+                    "measurement_level": measurement_level,
+                    "role": role,
+                    "column_width": _normalize_cell(getattr(row, "column_width", "")),
+                    "alignment": _normalize_cell(getattr(row, "alignment", "")),
+                    "print_format": _normalize_cell(getattr(row, "print_format", "")),
+                    "write_format": _normalize_cell(getattr(row, "write_format", "")),
+                    "missing_values": _normalize_cell(getattr(row, "missing_values", "")),
+                }
+                context_fields = {key: value for key, value in context_fields.items() if value}
 
                 records.append(
                     QuestionRecord(
                         question_id=variable,
                         question_text=label,
-                        measurement_level=str(getattr(row, "measurement_level", "") or "Unknown"),
-                        role=str(getattr(row, "role", "") or "Unknown"),
+                        measurement_level=measurement_level,
+                        role=role,
                         source_file=str(source_path),
                         survey_name=infer_survey_name(variable),
                         wave_year=infer_wave_year(variable),
                         value_labels=value_labels,
                         topic_labels=topic_labels,
                         topic_label_sources=topic_label_sources,
+                        context_fields=context_fields,
                     )
                 )
         if not records:
             raise FileNotFoundError("No valid Excel source files were found for ingestion.")
         return records
+
+
+def _normalize_cell(value: object) -> str:
+    """Normalize heterogeneous Excel cell values into compact display strings."""
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
