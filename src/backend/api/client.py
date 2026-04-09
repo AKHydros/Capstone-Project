@@ -13,12 +13,14 @@ from ..services.bootstrap_service import BootstrapArtifacts
 
 class ApiClient:
     def __init__(self, config: AppConfig, artifacts: BootstrapArtifacts) -> None:
+        """Initializes API client with remote base URL and local fallback artifacts."""
         self.config = config
         self.artifacts = artifacts
         self.base_url = config.api_base_url.rstrip("/")
 
     @property
     def using_remote_api(self) -> bool:
+        """Indicates whether calls should go over HTTP (`API_BASE_URL` set)."""
         return bool(self.base_url)
 
     def agent_router(
@@ -34,6 +36,7 @@ class ApiClient:
         inference: dict[str, int | float] | None = None,
         input_method: str = "document",
     ) -> dict[str, Any]:
+        """Calls `/api/agent-router` remotely or local router fallback."""
         payload = {
             "session_id": session_id,
             "query": query,
@@ -61,12 +64,14 @@ class ApiClient:
         )
 
     def compliance_status(self) -> dict[str, Any]:
+        """Retrieves compliance status remotely or locally."""
         return self._remote_or_fallback(
             lambda: self._get_json("/api/compliance-status"),
             self._local_compliance_status,
         )
 
     def consent_record(self, *, session_id: str, user_consent: bool, locale: str) -> dict[str, Any]:
+        """Records consent remotely or locally with current UTC timestamp."""
         timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         payload = {
             "session_id": session_id,
@@ -85,30 +90,35 @@ class ApiClient:
         )
 
     def llm_health(self) -> dict[str, Any]:
+        """Retrieves LLM health remotely or locally."""
         return self._remote_or_fallback(
             lambda: self._get_json("/api/health/llm", include_auth=False),
             self._local_llm_health,
         )
 
     def metrics_sla(self) -> dict[str, Any]:
+        """Retrieves SLA metrics remotely or from local observability store."""
         return self._remote_or_fallback(
             lambda: self._get_json("/api/metrics/sla"),
             lambda: self.artifacts.observability_store.sla_metrics(),
         )
 
     def monthly_snapshots(self) -> dict[str, Any]:
+        """Retrieves monthly snapshots payload remotely or locally."""
         return self._remote_or_fallback(
             lambda: self._get_json("/api/metrics/monthly-snapshots"),
             self._local_monthly_snapshots,
         )
 
     def get_trace(self, trace_id: str) -> dict[str, Any] | None:
+        """Retrieves trace payload remotely or locally."""
         return self._remote_or_fallback(
             lambda: self._get_json(f"/api/traces/{trace_id}"),
             lambda: self.artifacts.observability_store.get_trace(trace_id),
         )
 
     def governance_items(self, status: str | None = None, limit: int = 200) -> dict[str, Any]:
+        """Retrieves governance listing remotely or locally."""
         return self._remote_or_fallback(
             lambda: self._get_json(
                 "/api/governance-items",
@@ -121,24 +131,28 @@ class ApiClient:
         )
 
     def update_governance_status(self, item_id: int, status: str) -> dict[str, Any]:
+        """Updates governance item status remotely or locally."""
         return self._remote_or_fallback(
             lambda: self._post_json(f"/api/governance-items/{item_id}/status", None, params={"status": status}),
             lambda: self._local_update_governance_status(item_id=item_id, status=status),
         )
 
     def question_library(self) -> dict[str, Any]:
+        """Retrieves question-library payload remotely or locally."""
         return self._remote_or_fallback(
             lambda: self._get_json("/api/question-library"),
             self._local_question_library,
         )
 
     def index_health(self) -> dict[str, Any]:
+        """Retrieves index-health diagnostics remotely or locally."""
         return self._remote_or_fallback(
             lambda: self._get_json("/api/index/health"),
             self._local_index_health,
         )
 
     def rebuild_index(self, *, refresh_prompts: bool = False) -> dict[str, Any]:
+        """Requests reindex remotely or rebuilds local runtime artifacts."""
         return self._remote_or_fallback(
             lambda: self._post_json("/api/index/rebuild", {"refresh_prompts": refresh_prompts}),
             lambda: self._local_rebuild_index(refresh_prompts=refresh_prompts),
@@ -157,6 +171,7 @@ class ApiClient:
         inference: dict[str, int | float],
         input_method: str,
     ) -> dict[str, Any]:
+        """Local adapter call into `AgentRouterService.handle`."""
         output = self.artifacts.agent_router_service.handle(
             AgentRouterInput(
                 session_id=session_id,
@@ -186,6 +201,7 @@ class ApiClient:
         }
 
     def _local_compliance_status(self) -> dict[str, Any]:
+        """Local compliance-status builder."""
         health = self.artifacts.agent_router_service.llm_health_service.status()
         return {
             "consent_enforced": True,
@@ -206,6 +222,7 @@ class ApiClient:
         locale: str,
         timestamp: str,
     ) -> dict[str, Any]:
+        """Local consent/session persistence helper."""
         self.artifacts.observability_store.record_session_start(session_id, locale=locale, consent=user_consent)
         level = "full" if user_consent else "minimal"
         record_id = self.artifacts.observability_store.record_consent(
@@ -218,6 +235,7 @@ class ApiClient:
         return {"record_id": record_id, "effective_logging_level": level}
 
     def _local_llm_health(self) -> dict[str, Any]:
+        """Local LLM health payload helper."""
         health = self.artifacts.agent_router_service.llm_health_service.status()
         return {
             "status": health.status,
@@ -226,6 +244,7 @@ class ApiClient:
         }
 
     def _local_monthly_snapshots(self) -> dict[str, Any]:
+        """Local monthly snapshot generation helper."""
         self.artifacts.observability_store.create_monthly_snapshot()
         return {
             "snapshots": self.artifacts.observability_store.monthly_snapshots(),
@@ -233,10 +252,12 @@ class ApiClient:
         }
 
     def _local_update_governance_status(self, *, item_id: int, status: str) -> dict[str, Any]:
+        """Local governance status update helper."""
         self.artifacts.agent_router_service.governance_service.set_status(item_id, status)
         return {"ok": True, "item_id": item_id, "status": status}
 
     def _local_question_library(self) -> dict[str, Any]:
+        """Local question-library payload helper."""
         return {
             "top_questions": self.artifacts.top_questions,
             "generated_questions": self.artifacts.generated_questions,
@@ -244,11 +265,13 @@ class ApiClient:
         }
 
     def _local_index_health(self) -> dict[str, Any]:
+        """Local index/cache diagnostics payload helper."""
         semantic_cache_stats = self.artifacts.chatbot_service.retriever.semantic.embedding_cache_stats()
         answer_cache_stats = self.artifacts.chatbot_service.answer_cache_stats()
         router_cache_stats = self.artifacts.agent_router_service.query_cache.stats()
 
         def hit_rate(hits: int, misses: int) -> float:
+            """Nested helper that computes cache hit-rate percentages safely."""
             total = hits + misses
             return round(hits / total, 4) if total else 0.0
 
@@ -277,6 +300,7 @@ class ApiClient:
         }
 
     def _local_rebuild_index(self, *, refresh_prompts: bool) -> dict[str, Any]:
+        """Rebuilds local runtime and returns fresh index-health payload."""
         self.artifacts = BootstrapService(self.config).build(
             force_rebuild_cache=True,
             force_refresh_prompts=refresh_prompts,
@@ -284,6 +308,7 @@ class ApiClient:
         return {"ok": True, "index_health": self._local_index_health()}
 
     def _remote_or_fallback(self, remote_fn: Callable[[], Any], fallback_fn: Callable[[], Any]) -> Any:
+        """Executes remote path when available; falls back on HTTP error."""
         if not self.using_remote_api:
             return fallback_fn()
         try:
@@ -298,6 +323,7 @@ class ApiClient:
         params: dict[str, object] | None = None,
         include_auth: bool = True,
     ) -> dict[str, Any]:
+        """Executes authenticated GET and returns JSON payload."""
         headers = self._headers(include_auth=include_auth)
         with httpx.Client(timeout=25.0) as client:
             response = client.get(f"{self.base_url}{path}", headers=headers, params=params)
@@ -311,6 +337,7 @@ class ApiClient:
         *,
         params: dict[str, object] | None = None,
     ) -> dict[str, Any]:
+        """Executes authenticated POST and returns JSON payload."""
         headers = self._headers(include_auth=True)
         with httpx.Client(timeout=40.0) as client:
             response = client.post(f"{self.base_url}{path}", headers=headers, json=payload, params=params)
@@ -318,6 +345,7 @@ class ApiClient:
             return response.json()
 
     def _headers(self, *, include_auth: bool) -> dict[str, str]:
+        """Builds request headers, including internal token when required."""
         headers = {"accept": "application/json"}
         if include_auth:
             headers["x-internal-token"] = self.config.api_internal_token

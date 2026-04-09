@@ -18,19 +18,23 @@ class QuestionRecord:
 
     @property
     def value_labels_text(self) -> str:
+        """Returns compact joined string of value labels (up to 20)."""
         return " | ".join(self.value_labels[:20])
 
     @property
     def topic_labels_text(self) -> str:
+        """Returns comma-separated topic labels."""
         return ", ".join(self.topic_labels)
 
     @property
     def topic_sources_text(self) -> str:
+        """Returns topic labels annotated with source attribution."""
         pairs = [f"{topic} ({self.topic_label_sources.get(topic, 'Unknown')})" for topic in self.topic_labels]
         return ", ".join(pairs)
 
     @property
     def document_text(self) -> str:
+        """Returns normalized text payload used for indexing/retrieval."""
         return "\n".join(
             [
                 f"Question ID: {self.question_id}",

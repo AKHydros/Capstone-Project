@@ -31,6 +31,7 @@ class AppConfig:
 
 
 def _parse_csv_env(raw: str) -> tuple[str, ...]:
+    """Parses comma-separated env values into unique ordered tuple."""
     seen: set[str] = set()
     values: list[str] = []
     for item in raw.split(","):
@@ -42,12 +43,14 @@ def _parse_csv_env(raw: str) -> tuple[str, ...]:
 
 
 def _parse_bool_env(raw: str | None, *, default: bool) -> bool:
+    """Parses boolean-like env strings with default fallback."""
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 @lru_cache(maxsize=1)
 def load_config() -> AppConfig:
+    """Loads all runtime configuration from environment variables (memoized)."""
     source = os.getenv(
         "EXCEL_SOURCE_PATH",
         "data/market_research_capstone_draft_1.xlsx",
@@ -101,4 +104,5 @@ def load_config() -> AppConfig:
 
 
 def reset_config_cache() -> None:
+    """Clears memoized config to force re-read from environment."""
     load_config.cache_clear()

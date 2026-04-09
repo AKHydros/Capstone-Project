@@ -11,15 +11,18 @@ from backend.services.chatbot_service import ChatbotService
 
 class StubLlmClient:
     def __init__(self) -> None:
+        """Enable LLM mode in tests while counting summarize calls for assertions."""
         self.enabled = True
         self.calls = 0
 
     def summarize(self, *args, **kwargs) -> str:  # noqa: ANN002, ANN003
+        """Return a fixed summary string and increment the stub call counter."""
         self.calls += 1
         return "LLM summary"
 
 
 def make_records() -> list[QuestionRecord]:
+    """Build two survey records used across hybrid and RAG behavior tests."""
     return [
         QuestionRecord(
             question_id="PMG22_WAI_q1",
@@ -50,6 +53,7 @@ def make_records() -> list[QuestionRecord]:
 
 class RagUpgradeTests(unittest.TestCase):
     def test_hybrid_search_returns_stable_top_result(self) -> None:
+        """Assert repeated hybrid queries keep the same top-ranked record."""
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
             retriever = HybridRetriever.build(make_records())
 
@@ -62,6 +66,7 @@ class RagUpgradeTests(unittest.TestCase):
         self.assertGreaterEqual(first.diagnostics.top_score, first.diagnostics.second_score)
 
     def test_confidence_gate_skips_llm_for_high_confidence_queries(self) -> None:
+        """Assert confidence gates keep response deterministic and skip LLM calls."""
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
             retriever = HybridRetriever.build(make_records())
         llm = StubLlmClient()
@@ -88,6 +93,7 @@ class RagUpgradeTests(unittest.TestCase):
         self.assertEqual(llm.calls, 0)
 
     def test_llm_synthesis_uses_answer_cache_on_repeated_queries(self) -> None:
+        """Assert repeated synthesis queries hit answer cache after first LLM call."""
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
             retriever = HybridRetriever.build(make_records())
         llm = StubLlmClient()

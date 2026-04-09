@@ -47,6 +47,7 @@ class BootstrapArtifacts:
 
 class BootstrapService:
     def __init__(self, config: AppConfig) -> None:
+        """Stores app configuration for runtime assembly."""
         self.config = config
 
     def build(
@@ -54,6 +55,7 @@ class BootstrapService:
         force_rebuild_cache: bool = False,
         force_refresh_prompts: bool = False,
     ) -> BootstrapArtifacts:
+        """Constructs full runtime graph: data loading, retriever, caches, services, governance, observability."""
         data_dir = _infer_data_dir(self.config.excel_source_path)
         source_paths = _collect_excel_sources(self.config.excel_source_path, data_dir)
         repository = ExcelRepository(source_paths)
@@ -160,12 +162,14 @@ class BootstrapService:
 
 
 def _infer_data_dir(excel_source_path: Path) -> Path:
+    """Determines data directory fallback when source parent is missing."""
     if excel_source_path.parent.exists():
         return excel_source_path.parent
     return Path.cwd() / "data"
 
 
 def _collect_excel_sources(primary_source: Path, data_dir: Path) -> list[Path]:
+    """Collects primary and uploaded Excel sources for ingestion."""
     sources: list[Path] = []
     if primary_source.exists():
         sources.append(primary_source)

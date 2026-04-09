@@ -28,6 +28,7 @@ class ChatbotService:
     rag_score_gap_threshold: float = field(init=False)
 
     def __post_init__(self) -> None:
+        """Initializes RAG behavior flags and answer cache from overrides/env."""
         self.rag_enabled = (
             self.rag_enabled_override if self.rag_enabled_override is not None else _env_bool("RAG_ENABLED", default=True)
         )
@@ -60,6 +61,7 @@ class ChatbotService:
         llm_model: str | None = None,
         inference: dict[str, int | float] | None = None,
     ) -> ChatResponse:
+        """Main chat pipeline: exact-ID lookup, allowed-values path, hybrid retrieval, LLM/deterministic answer selection, answer caching."""
         exact_response = self._exact_question_lookup_response(
             query=query,
             survey_name=survey_name,
@@ -189,6 +191,7 @@ class ChatbotService:
         )
 
     def answer_cache_stats(self) -> CacheStats:
+        """Returns answer cache usage counters."""
         return self.answer_cache.stats()
 
     def _should_use_llm(
@@ -199,6 +202,7 @@ class ChatbotService:
         diagnostics: RetrievalDiagnostics,
         confidence: float,
     ) -> bool:
+        """Applies RAG confidence/gap logic to decide if synthesis is needed."""
         if not llm_requested:
             return False
         if not self.rag_enabled:
@@ -213,9 +217,11 @@ class ChatbotService:
         return not high_confidence
 
     def _confidence_score(self, diagnostics: RetrievalDiagnostics) -> float:
+        """Converts retrieval diagnostics top score into bounded confidence."""
         return max(0.0, min(1.0, diagnostics.top_score))
 
     def _is_synthesis_intent(self, query: str) -> bool:
+        """Detects explicit summarize/analysis intent in user query."""
         lowered = query.lower()
         keywords = (
             "summarize",
@@ -237,6 +243,7 @@ class ChatbotService:
         cards: list[QuestionRecord],
         llm_provider: str,
     ) -> str:
+        """Builds grounded non-LLM fallback answer from top cards."""
         top = cards[0]
         lines: list[str] = [
             f"Top grounded match: {top.question_id} - {top.question_text}.",
@@ -271,6 +278,7 @@ class ChatbotService:
         retrieval_mode: str,
         llm_model: str | None,
     ) -> str:
+        """Creates deterministic key for answer-level cache."""
         top_ids = [item.question_id for item in cards[:8]]
         top_ids_fingerprint = hashlib.sha256("|".join(top_ids).encode("utf-8")).hexdigest()
         payload = {
@@ -297,6 +305,7 @@ class ChatbotService:
         topic_label: str | None,
         topic_source_type: str | None,
     ) -> ChatResponse | None:
+        """Executes deterministic survey/question variant lookup (including alias variants) before fuzzy search."""
         question_ref = self._extract_question_ref(query)
         if question_ref is None:
             return None
@@ -366,6 +375,7 @@ class ChatbotService:
         topic_label: str | None,
         topic_source_type: str | None,
     ) -> ChatResponse | None:
+        """Handles allowed-values intent with direct value-label answers."""
         if not self._is_allowed_values_intent(query):
             return None
 
@@ -450,6 +460,7 @@ class ChatbotService:
         )
 
     def _is_allowed_values_intent(self, query: str) -> bool:
+        """Detects dropdown/options-related intent keywords."""
         lowered = query.lower()
         keywords = (
             "dropdown",
@@ -467,12 +478,14 @@ class ChatbotService:
         return any(keyword in lowered for keyword in keywords)
 
     def _extract_survey_name(self, query: str) -> str | None:
+        """Extracts survey token like `PMG20_GAM` from free text."""
         match = re.search(r"\b([A-Za-z]{3}\d{2}_[A-Za-z]{3})\b", query)
         if not match:
             return None
         return match.group(1).upper()
 
     def _extract_question_ref(self, query: str) -> str | None:
+        """Extracts question reference token (supports `q` and `qq` ID forms)."""
         id_match = re.search(r"\b[A-Za-z]{3}\d{2}_[A-Za-z]{3}_q{1,2}(\d{1,3}[a-z]?)\b", query, flags=re.IGNORECASE)
         if id_match:
             return f"q{id_match.group(1).lower()}"
@@ -483,6 +496,7 @@ class ChatbotService:
         return f"q{q_match.group(1).lower()}"
 
     def _match_question_ref_records(self, records: list[QuestionRecord], question_ref: str | None) -> list[QuestionRecord]:
+        """Filters records that match extracted question reference."""
         if not question_ref:
             return []
 
@@ -509,28 +523,33 @@ class ChatbotService:
         return sorted(matches, key=lambda item: item.question_id)
 
     def _question_component(self, question_id: str) -> str | None:
+        """Extracts question number/suffix component from variable ID."""
         match = re.search(r"_q{1,2}(\d+[a-z]?)\b", question_id.lower())
         if not match:
             return None
         return match.group(1)
 
     def _split_question_ref(self, question_ref: str) -> tuple[str, str] | None:
+        """Splits normalized question ref into number/suffix tuple."""
         match = re.match(r"^q(\d+)([a-z]?)$", question_ref.strip().lower())
         if not match:
             return None
         return self._normalize_question_number(match.group(1)), match.group(2)
 
     def _split_question_component(self, component: str) -> tuple[str, str] | None:
+        """Splits extracted component into number/suffix tuple."""
         match = re.match(r"^(\d+)([a-z]?)$", component.strip().lower())
         if not match:
             return None
         return self._normalize_question_number(match.group(1)), match.group(2)
 
     def _normalize_question_number(self, number: str) -> str:
+        """Normalizes numeric component (e.g., strips leading zeros)."""
         normalized = number.strip().lstrip("0")
         return normalized or "0"
 
     def _build_variant_map(self, records: list[QuestionRecord], ref_number: str) -> dict[str, list[QuestionRecord]]:
+        """Groups matching records into variant buckets (`11a`, `11b`, etc.)."""
         variant_map: dict[str, list[QuestionRecord]] = {}
         for record in records:
             component = self._question_component(record.question_id)
@@ -549,16 +568,19 @@ class ChatbotService:
         return {key: sorted(variant_map[key], key=self._record_sort_key) for key in ordered_keys}
 
     def _variant_sort_key(self, key: str) -> tuple[int, str]:
+        """Defines deterministic variant sort order."""
         match = re.match(r"^(\d+)([a-z]?)$", key.lower())
         if not match:
             return (10_000, key.lower())
         return (int(match.group(1)), match.group(2))
 
     def _record_sort_key(self, record: QuestionRecord) -> tuple[int, str]:
+        """Prioritizes canonical IDs over alias IDs when selecting representative record."""
         alias_penalty = 1 if "_qq" in record.question_id.lower() else 0
         return (alias_penalty, record.question_id.lower())
 
     def _best_variant_record(self, records: list[QuestionRecord]) -> QuestionRecord:
+        """Chooses best representative record for a variant bucket."""
         records_with_values = [record for record in records if record.value_labels]
         candidate_pool = records_with_values or records
         return sorted(candidate_pool, key=self._record_sort_key)[0]
@@ -570,6 +592,7 @@ class ChatbotService:
         variant_key: str,
         records: list[QuestionRecord],
     ) -> ChatResponse:
+        """Builds final answer for a specific variant, merging value-label aliases."""
         records_with_values = [record for record in records if record.value_labels]
         candidate_pool = records_with_values or records
         primary = sorted(candidate_pool, key=self._record_sort_key)[0]
@@ -603,6 +626,7 @@ class ChatbotService:
         )
 
     def _merge_value_labels(self, records: list[QuestionRecord]) -> list[str]:
+        """Deduplicates/merges formatted value labels across records."""
         merged: list[str] = []
         seen: set[str] = set()
         for record in records:
@@ -624,6 +648,7 @@ class ChatbotService:
         topic_source_type: str | None,
         query: str,
     ) -> list[QuestionRecord]:
+        """Uses docx-derived hints to improve question-reference retrieval fallback."""
         survey_hints = self.doc_question_hints.get(survey_name.upper(), {})
         hint_lines = list(survey_hints.get(question_ref, []))
         if not hint_lines and question_ref:
@@ -643,6 +668,7 @@ class ChatbotService:
         return self._match_question_ref_records(hinted_ranked, question_ref)
 
     def _format_value_labels(self, value_labels: list[str]) -> list[str]:
+        """Normalizes value-label formatting (including numeric cleanup)."""
         out: list[str] = []
         for item in value_labels:
             cleaned = item.strip()
@@ -659,10 +685,12 @@ class ChatbotService:
 
 
 def _normalize_query(query: str) -> str:
+    """Module helper to normalize query strings for cache keys."""
     return " ".join(query.lower().split())
 
 
 def _env_bool(name: str, *, default: bool) -> bool:
+    """Reads boolean env variable with fallback."""
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -670,6 +698,7 @@ def _env_bool(name: str, *, default: bool) -> bool:
 
 
 def _env_float(name: str, *, default: float) -> float:
+    """Reads float env variable with fallback."""
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -680,6 +709,7 @@ def _env_float(name: str, *, default: float) -> float:
 
 
 def _env_int(name: str, *, default: int) -> int:
+    """Reads integer env variable with fallback."""
     raw = os.getenv(name)
     if raw is None:
         return default

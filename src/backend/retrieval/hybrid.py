@@ -40,6 +40,7 @@ class HybridRetriever:
 
     @classmethod
     def build(cls, records: list[QuestionRecord]) -> "HybridRetriever":
+        """Builds chunks + lexical + semantic retrievers from records."""
         chunks = ingest_clean_chunk(records)
         return cls(
             records=records,
@@ -57,6 +58,7 @@ class HybridRetriever:
         topic_source_type: str | None = None,
         top_k: int | None = None,
     ) -> HybridSearchResult:
+        """Runs weighted lexical+semantic ranking, filtering, and returns diagnostics."""
         top_k = top_k or RETRIEVAL_RULES.top_k
         lexical_scores = self.lexical.score(query)
         try:
@@ -139,6 +141,7 @@ class HybridRetriever:
         topic_source_type: str | None = None,
         top_k: int | None = None,
     ) -> list[QuestionRecord]:
+        """Convenience wrapper returning only ranked records."""
         result = self.search_with_details(
             query=query,
             survey_name=survey_name,

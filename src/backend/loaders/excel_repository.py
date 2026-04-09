@@ -19,6 +19,7 @@ class ExcelRepository:
     source_paths: list[Path]
 
     def load_records(self) -> list[QuestionRecord]:
+        """Reads Excel sheets, builds value-label mappings, and returns normalized `QuestionRecord` list."""
         records: list[QuestionRecord] = []
         seen_question_ids: set[str] = set()
         for source_path in self.source_paths:

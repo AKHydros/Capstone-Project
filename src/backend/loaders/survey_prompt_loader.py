@@ -25,6 +25,7 @@ class QuestionHintCachePayload:
 
 class SurveyPromptLoader:
     def __init__(self, data_dir: Path, cache_dir: Path) -> None:
+        """Configures docx source and cache paths."""
         self.data_dir = data_dir
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -32,6 +33,7 @@ class SurveyPromptLoader:
         self.question_hint_cache_path = self.cache_dir / "doc_question_hints.json"
 
     def load_prompts(self, max_prompts: int = 20, force_refresh: bool = False) -> list[str]:
+        """Loads/caches starter prompts extracted from docx files."""
         docx_files = sorted(self.data_dir.rglob("*.docx"))
         signature = self._build_signature(docx_files)
 
@@ -44,12 +46,14 @@ class SurveyPromptLoader:
         return prompts
 
     def clear_cache(self) -> None:
+        """Removes prompt and question-hint cache files."""
         if self.cache_path.exists():
             self.cache_path.unlink()
         if self.question_hint_cache_path.exists():
             self.question_hint_cache_path.unlink()
 
     def load_question_hints(self, force_refresh: bool = False) -> dict[str, dict[str, list[str]]]:
+        """Loads/caches survey question hints extracted from docx files."""
         docx_files = sorted(self.data_dir.rglob("*.docx"))
         signature = f"hints-v1|{self._build_signature(docx_files)}"
 
@@ -62,6 +66,7 @@ class SurveyPromptLoader:
         return hints
 
     def _extract_prompts(self, files: list[Path], max_prompts: int) -> list[str]:
+        """Extracts normalized, deduplicated prompt candidates from paragraphs."""
         seen: set[str] = set()
         out: list[str] = []
         for file_path in files:
@@ -79,6 +84,7 @@ class SurveyPromptLoader:
         return out
 
     def _extract_question_hints(self, files: list[Path]) -> dict[str, dict[str, list[str]]]:
+        """Extracts question reference hints keyed by survey and question token."""
         out: dict[str, dict[str, list[str]]] = {}
         for file_path in files:
             survey_name = file_path.stem.upper()
@@ -102,6 +108,7 @@ class SurveyPromptLoader:
         return out
 
     def _iter_paragraphs(self, file_path: Path):
+        """Iterates normalized paragraph text from a `.docx` XML document."""
         try:
             with zipfile.ZipFile(file_path) as archive:
                 root = ET.fromstring(archive.read("word/document.xml"))
@@ -114,6 +121,7 @@ class SurveyPromptLoader:
                 yield text
 
     def _normalize_candidate(self, text: str) -> str | None:
+        """Filters and normalizes prompt text candidates."""
         if "?" not in text:
             return None
         text = text.strip()
@@ -130,6 +138,7 @@ class SurveyPromptLoader:
         return text
 
     def _build_signature(self, files: list[Path]) -> str:
+        """Computes prompt-cache signature from file names/sizes/mtimes."""
         parts: list[str] = []
         for p in files:
             stat = p.stat()
@@ -137,6 +146,7 @@ class SurveyPromptLoader:
         return "|".join(parts)
 
     def _read_cache(self) -> PromptCachePayload | None:
+        """Reads and validates starter prompt cache payload."""
         if not self.cache_path.exists():
             return None
         try:
@@ -151,12 +161,14 @@ class SurveyPromptLoader:
         return PromptCachePayload(signature=signature, prompts=cleaned)
 
     def _write_cache(self, payload: PromptCachePayload) -> None:
+        """Writes starter prompt cache payload to disk."""
         self.cache_path.write_text(
             json.dumps({"signature": payload.signature, "prompts": payload.prompts}, indent=2),
             encoding="utf-8",
         )
 
     def _read_question_hint_cache(self) -> QuestionHintCachePayload | None:
+        """Reads and validates question-hint cache payload."""
         if not self.question_hint_cache_path.exists():
             return None
         try:
@@ -183,6 +195,7 @@ class SurveyPromptLoader:
         return QuestionHintCachePayload(signature=signature, hints=cleaned)
 
     def _write_question_hint_cache(self, payload: QuestionHintCachePayload) -> None:
+        """Writes question-hint cache payload to disk."""
         self.question_hint_cache_path.write_text(
             json.dumps({"signature": payload.signature, "hints": payload.hints}, indent=2),
             encoding="utf-8",

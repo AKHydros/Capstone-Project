@@ -14,6 +14,7 @@ class LlmHealthStatus:
 
 class LlmHealthService:
     def status(self) -> LlmHealthStatus:
+        """Reports `Connected` when API key exists, otherwise `Degraded` with reason."""
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         if api_key:

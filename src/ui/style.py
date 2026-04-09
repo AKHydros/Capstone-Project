@@ -4,6 +4,7 @@ import streamlit as st
 
 
 def apply_pmg_theme() -> None:
+    """Injects custom CSS style overrides into Streamlit app."""
     st.markdown(
         """
         <style>

@@ -43,11 +43,13 @@ class CacheInspectResult:
 
 class IndexCache:
     def __init__(self, cache_dir: Path) -> None:
+        """Initializes cache directory and cache file path."""
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_file = self.cache_dir / "hybrid_retriever.pkl"
 
     def load(self, signature: str) -> HybridRetriever | None:
+        """Loads retriever bundle if cache exists and signature matches."""
         bundle = self._read_bundle()
         if bundle is None:
             return None
@@ -56,6 +58,7 @@ class IndexCache:
         return bundle.retriever
 
     def inspect(self, signature: str) -> CacheInspectResult:
+        """Returns cache status (`latent`, `stale`, `updated`) plus metadata."""
         bundle = self._read_bundle()
         if bundle is None:
             return CacheInspectResult(
@@ -83,6 +86,7 @@ class IndexCache:
         )
 
     def save(self, signature: str, retriever: HybridRetriever) -> None:
+        """Serializes retriever + metadata to cache file."""
         embedding_mode = retriever.semantic.mode if hasattr(retriever, "semantic") else "unknown"
         bundle = CacheBundle(
             metadata=CacheMetadata(
@@ -99,10 +103,12 @@ class IndexCache:
             pickle.dump(bundle, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     def clear(self) -> None:
+        """Deletes cache file if present."""
         if self.cache_file.exists():
             self.cache_file.unlink()
 
     def _read_bundle(self) -> CacheBundle | None:
+        """Reads and validates cached bundle, normalizing legacy metadata."""
         if not self.cache_file.exists():
             return None
         try:
@@ -122,6 +128,7 @@ class IndexCache:
         return CacheBundle(metadata=normalized_metadata, retriever=bundle.retriever)
 
     def _normalize_metadata(self, metadata: CacheMetadata, retriever: HybridRetriever) -> CacheMetadata:
+        """Backfills/normalizes metadata fields for compatibility."""
         signature = getattr(metadata, "signature", "")
         if not signature:
             raise ValueError("Invalid cache metadata: missing signature")
@@ -148,6 +155,7 @@ def build_signature(
     has_openai_key: bool,
     rules_fingerprint: str,
 ) -> str:
+    """Builds deterministic cache signature from sources, model mode, and rules."""
     source_parts: list[str] = []
     for source_path in sorted(excel_source_paths, key=lambda p: str(p)):
         stat = source_path.stat()

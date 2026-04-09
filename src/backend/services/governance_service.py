@@ -17,6 +17,7 @@ class GovernanceLabels:
 
 class GovernanceService:
     def __init__(self, store: ObservabilityStore) -> None:
+        """Stores observability/governance persistence dependency."""
         self.store = store
 
     def generate_labels_takeaways(
@@ -26,6 +27,7 @@ class GovernanceService:
         answer: str,
         ranked_results: list[QuestionRecord],
     ) -> GovernanceLabels:
+        """Derives governance labels and key takeaways from ranked results."""
         labels = sorted({label for r in ranked_results for label in r.topic_labels})[:5]
         if not labels:
             labels = ["General"]
@@ -50,6 +52,7 @@ class GovernanceService:
         takeaways: list[str],
         last_trace_id: str | None,
     ) -> int:
+        """Saves or updates governance item with validated status."""
         normalized_status = status if status in VALID_STATUSES else "Draft"
         return self.store.upsert_governance_item(
             question_text=question_text,
@@ -61,9 +64,11 @@ class GovernanceService:
         )
 
     def set_status(self, item_id: int, status: str) -> None:
+        """Validates and updates governance item status."""
         if status not in VALID_STATUSES:
             raise ValueError(f"Invalid governance status: {status}")
         self.store.update_governance_status(item_id, status)
 
     def approved_library(self, limit: int = 100) -> list[dict[str, object]]:
+        """Returns approved governance library items."""
         return self.store.list_governance_items(status="Approved", limit=limit)

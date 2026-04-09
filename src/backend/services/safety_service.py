@@ -21,6 +21,7 @@ class SafetyResult:
 
 class SafetyService:
     def check_user_query(self, query: str) -> SafetyResult:
+        """Blocks known unsafe phrases in user input."""
         lowered = query.lower()
         for phrase in _BLOCKED_TOPICS:
             if phrase in lowered:
@@ -28,6 +29,7 @@ class SafetyService:
         return SafetyResult(allowed=True, reason="ok")
 
     def check_assistant_response(self, response_text: str) -> SafetyResult:
+        """Blocks known unsafe phrases in assistant output."""
         lowered = response_text.lower()
         for phrase in _BLOCKED_TOPICS:
             if phrase in lowered:
@@ -35,6 +37,7 @@ class SafetyService:
         return SafetyResult(allowed=True, reason="ok")
 
     def redact_pii(self, text: str) -> str:
+        """Redacts email addresses and phone numbers in text."""
         redacted = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[redacted-email]", text)
         redacted = re.sub(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", "[redacted-phone]", redacted)
         return redacted

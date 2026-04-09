@@ -11,11 +11,13 @@ class _DummyLlmClient:
     enabled = False
 
     def summarize(self, *args, **kwargs):  # pragma: no cover
+        """Fail fast if a test unexpectedly tries to call LLM summarization."""
         raise AssertionError("LLM summarize should not be called in these tests")
 
 
 class _FakeRetriever:
     def __init__(self, records: list[QuestionRecord]) -> None:
+        """Store fixture records and initialize call counters for assertions."""
         self.records = records
         self.search_with_details_calls = 0
         self.search_calls = 0
@@ -29,6 +31,7 @@ class _FakeRetriever:
         topic_source_type: str | None = None,
         top_k: int | None = None,
     ) -> HybridSearchResult:
+        """Return deterministic scored results and diagnostics for service-level tests."""
         del query, survey_name, wave_year, topic_label, topic_source_type, top_k
         self.search_with_details_calls += 1
         scored = [ScoredRecord(record=record, score=max(0.1, 1.0 - (idx * 0.05))) for idx, record in enumerate(self.records)]
@@ -51,12 +54,14 @@ class _FakeRetriever:
         topic_source_type: str | None = None,
         top_k: int | None = None,
     ) -> list[QuestionRecord]:
+        """Return fixture records while tracking fallback lexical search invocations."""
         del query, survey_name, wave_year, topic_label, topic_source_type
         self.search_calls += 1
         return self.records[: top_k or len(self.records)]
 
 
 def _record(question_id: str, text: str, values: list[str]) -> QuestionRecord:
+    """Build a standardized `QuestionRecord` fixture for PMG20_GAM scenarios."""
     return QuestionRecord(
         question_id=question_id,
         question_text=text,
@@ -73,6 +78,7 @@ def _record(question_id: str, text: str, values: list[str]) -> QuestionRecord:
 
 class ChatbotServiceDeterministicLookupTests(unittest.TestCase):
     def setUp(self) -> None:
+        """Create shared fixtures covering aliased and multi-variant question IDs."""
         self.records = [
             _record("PMG20_GAM_q11a", "Banks", []),
             _record("PMG20_GAM_qq11a", "Banks", ["1: Yes", "2: No", "98: Not sure"]),
@@ -89,6 +95,7 @@ class ChatbotServiceDeterministicLookupTests(unittest.TestCase):
         )
 
     def test_question_11_options_returns_variant_clarification(self) -> None:
+        """Assert broad `question 11` lookup prompts user to pick a specific variant."""
         response = self.service.chat("What are the dropdown options for PMG20_GAM question 11?")
         self.assertIn("multiple variants", response.answer.lower())
         self.assertIn("`11a`", response.answer)
@@ -98,6 +105,7 @@ class ChatbotServiceDeterministicLookupTests(unittest.TestCase):
         self.assertEqual(self.retriever.search_with_details_calls, 0)
 
     def test_question_11a_options_uses_alias_backed_values(self) -> None:
+        """Assert specific `question 11a` lookup merges alias-backed dropdown values."""
         response = self.service.chat("What are the dropdown options for PMG20_GAM question 11a?")
         self.assertIn("allowable response options", response.answer.lower())
         self.assertIn("- 1: Yes", response.answer)
@@ -109,6 +117,7 @@ class ChatbotServiceDeterministicLookupTests(unittest.TestCase):
         self.assertEqual(response.variant_count, 1)
 
     def test_question_12_options_returns_variant_clarification(self) -> None:
+        """Assert broad `question 12` lookup returns a variant disambiguation prompt."""
         response = self.service.chat("What are the dropdown options for PMG20_GAM question 12?")
         self.assertIn("multiple variants", response.answer.lower())
         self.assertIn("`12a`", response.answer)
@@ -117,6 +126,7 @@ class ChatbotServiceDeterministicLookupTests(unittest.TestCase):
         self.assertEqual(response.variant_count, 2)
 
     def test_question_12a_options_returns_values(self) -> None:
+        """Assert specific `question 12a` lookup returns coded allowable values."""
         response = self.service.chat("What are the dropdown options for PMG20_GAM question 12a?")
         self.assertIn("allowable response options", response.answer.lower())
         self.assertIn("- 1: Yes", response.answer)
@@ -125,6 +135,7 @@ class ChatbotServiceDeterministicLookupTests(unittest.TestCase):
         self.assertEqual(response.variant_count, 1)
 
     def test_non_id_query_uses_hybrid_fallback(self) -> None:
+        """Assert non-ID queries bypass exact lookup and use hybrid retrieval fallback."""
         response = self.service.chat("How likely are respondents to continue with their primary institution?")
         self.assertEqual(response.lookup_mode, "hybrid_fallback")
         self.assertEqual(response.variant_count, 0)

@@ -17,6 +17,7 @@ from ui.style import apply_pmg_theme
 
 @lru_cache(maxsize=1)
 def build_runtime(force_rebuild_cache: bool = False, force_refresh_prompts: bool = False) -> BootstrapArtifacts:
+    """Builds UI runtime artifacts (cached) via backend bootstrap."""
     config = load_config()
     return BootstrapService(config).build(
         force_rebuild_cache=force_rebuild_cache,
@@ -25,6 +26,7 @@ def build_runtime(force_rebuild_cache: bool = False, force_refresh_prompts: bool
 
 
 def _init_state() -> None:
+    """Initializes all Streamlit session state defaults."""
     if "force_rebuild_cache" not in st.session_state:
         st.session_state.force_rebuild_cache = False
     if "force_refresh_prompts" not in st.session_state:
@@ -72,6 +74,7 @@ def _init_state() -> None:
 
 
 def _save_uploaded_files(uploads_dir: Path, uploaded_files: list[object] | None) -> int:
+    """Persists uploaded files and returns count saved."""
     saved_count = 0
     for file in uploaded_files or []:
         target = uploads_dir / file.name
@@ -81,6 +84,7 @@ def _save_uploaded_files(uploads_dir: Path, uploaded_files: list[object] | None)
 
 
 def _cache_status_text(artifacts: BootstrapArtifacts) -> tuple[str, str, str, str]:
+    """Formats cache status summary values for UI display."""
     built_at = (
         datetime.fromtimestamp(artifacts.cache_status.created_at_epoch, tz=timezone.utc).isoformat(timespec="seconds")
         if artifacts.cache_status.created_at_epoch
@@ -95,6 +99,7 @@ def _cache_status_text(artifacts: BootstrapArtifacts) -> tuple[str, str, str, st
 
 
 def _request_cache_action(*, rebuild: bool, refresh_prompts: bool, toast_message: str) -> None:
+    """Schedules cache/prompt refresh action and triggers Streamlit rerun."""
     st.session_state.force_rebuild_cache = rebuild
     st.session_state.force_refresh_prompts = refresh_prompts
     st.session_state.pending_toast = toast_message
@@ -103,6 +108,7 @@ def _request_cache_action(*, rebuild: bool, refresh_prompts: bool, toast_message
 
 
 def _ensure_chat_session_enabled(client: ApiClient) -> None:
+    """Best-effort auto-consent call for chat session activation."""
     if st.session_state.session_consent_applied:
         return
     try:
@@ -119,6 +125,7 @@ def _ensure_chat_session_enabled(client: ApiClient) -> None:
 
 
 def _combine_starter_prompts(starter_prompts: list[str], top_questions: list[str]) -> list[str]:
+    """Merges and deduplicates starter prompts for UX."""
     combined: list[str] = []
     seen: set[str] = set()
     for prompt in [*top_questions, *starter_prompts]:
@@ -133,6 +140,7 @@ def _combine_starter_prompts(starter_prompts: list[str], top_questions: list[str
 
 
 def _chat_history_text(history: list[dict[str, str]]) -> str:
+    """Serializes chat history into plain-text transcript format."""
     lines: list[str] = []
     for msg in history:
         role = msg.get("role", "unknown").upper()
@@ -144,6 +152,7 @@ def _chat_history_text(history: list[dict[str, str]]) -> str:
 
 
 def _render_admin_dashboard(client: ApiClient) -> None:
+    """Renders health, index, SLA, trace, and governance admin panels."""
     st.markdown("### Admin & Monitoring Dashboard")
 
     st.markdown("#### System Health")

@@ -7,12 +7,14 @@ from openai import OpenAI
 
 class OpenAIChatClient:
     def __init__(self) -> None:
+        """Initializes OpenAI client if key is configured and sets default model."""
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
         self.client = OpenAI(api_key=api_key) if api_key else None
 
     @property
     def enabled(self) -> bool:
+        """Indicates whether chat client is configured and available."""
         return self.client is not None
 
     def summarize(
@@ -25,6 +27,7 @@ class OpenAIChatClient:
         top_p: float | None = None,
         temperature: float | None = None,
     ) -> str:
+        """Sends grounded chat prompts to OpenAI Responses API and returns text."""
         if not self.client:
             raise RuntimeError("OpenAI client is not configured")
 

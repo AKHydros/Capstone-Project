@@ -10,12 +10,14 @@ from typing import Any
 
 class ObservabilityStore:
     def __init__(self, db_path: Path) -> None:
+        """Initializes DB path and ensures observability schema exists."""
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
+        """Returns thread-local SQLite connection with performance PRAGMAs."""
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             return conn
@@ -32,12 +34,14 @@ class ObservabilityStore:
         return conn
 
     def close(self) -> None:
+        """Closes and clears current thread-local DB connection."""
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
             self._local.conn = None
 
     def _init_schema(self) -> None:
+        """Creates required tables and indexes for sessions/events/traces/governance."""
         with self._connect() as conn:
             cur = conn.cursor()
             cur.executescript(
@@ -140,6 +144,7 @@ class ObservabilityStore:
             conn.commit()
 
     def record_session_start(self, session_id: str, locale: str, consent: bool) -> None:
+        """Inserts session if absent with locale/consent state."""
         now = _now()
         with self._connect() as conn:
             conn.execute(
@@ -153,6 +158,7 @@ class ObservabilityStore:
             conn.commit()
 
     def ensure_session_and_get_consent(self, session_id: str, locale: str) -> bool:
+        """Ensures session row exists and returns current consent flag."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT consent FROM sessions WHERE session_id=?",
@@ -173,6 +179,7 @@ class ObservabilityStore:
             return False
 
     def session_has_consent(self, session_id: str) -> bool:
+        """Reads consent flag for session."""
         with self._connect() as conn:
             row = conn.execute("SELECT consent FROM sessions WHERE session_id=?", (session_id,)).fetchone()
         if row is None:
@@ -180,6 +187,7 @@ class ObservabilityStore:
         return bool(row["consent"])
 
     def record_session_end(self, session_id: str, completion_status: str = "completed") -> None:
+        """Marks session end time and completion status."""
         with self._connect() as conn:
             conn.execute(
                 "UPDATE sessions SET ended_at=?, completion_status=? WHERE session_id=?",
@@ -199,6 +207,7 @@ class ObservabilityStore:
         payload: dict[str, Any] | None,
         error_text: str | None,
     ) -> None:
+        """Inserts event record with payload/error details."""
         with self._connect() as conn:
             conn.execute(
                 """
@@ -229,6 +238,7 @@ class ObservabilityStore:
         latency_ms: float,
         status: str,
     ) -> None:
+        """Upserts trace record and latency/fallback metadata."""
         with self._connect() as conn:
             conn.execute(
                 """
@@ -258,6 +268,7 @@ class ObservabilityStore:
         route_used: str,
         fallback_used: bool,
     ) -> None:
+        """Inserts query/response pair for audit and analytics."""
         with self._connect() as conn:
             conn.execute(
                 """
@@ -289,6 +300,7 @@ class ObservabilityStore:
         locale: str,
         effective_logging_level: str,
     ) -> int:
+        """Inserts consent record and updates session consent state."""
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -314,6 +326,7 @@ class ObservabilityStore:
         takeaways: list[str],
         last_trace_id: str | None,
     ) -> int:
+        """Upserts governance item by question text and returns item ID."""
         now = _now()
         with self._connect() as conn:
             conn.execute(
@@ -348,6 +361,7 @@ class ObservabilityStore:
             return int(row["id"]) if row else 0
 
     def update_governance_status(self, item_id: int, status: str) -> None:
+        """Updates governance status and timestamp."""
         with self._connect() as conn:
             conn.execute(
                 "UPDATE governance_items SET status=?, updated_at=? WHERE id=?",
@@ -356,6 +370,7 @@ class ObservabilityStore:
             conn.commit()
 
     def list_governance_items(self, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        """Lists governance items with deserialized labels/takeaways."""
         query = "SELECT * FROM governance_items"
         params: list[Any] = []
         if status:
@@ -382,6 +397,7 @@ class ObservabilityStore:
         ]
 
     def governance_counts(self) -> dict[str, int]:
+        """Returns aggregate governance counts by status."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT status, COUNT(*) as c FROM governance_items GROUP BY status"
@@ -392,6 +408,7 @@ class ObservabilityStore:
         return counts
 
     def get_trace(self, trace_id: str) -> dict[str, Any] | None:
+        """Returns trace record and latest QA payload for that trace."""
         with self._connect() as conn:
             tr = conn.execute("SELECT * FROM traces WHERE trace_id=?", (trace_id,)).fetchone()
             if tr is None:
@@ -420,6 +437,7 @@ class ObservabilityStore:
         return payload
 
     def sla_metrics(self) -> dict[str, Any]:
+        """Computes p50/p95 latency and operational rates/counters."""
         with self._connect() as conn:
             lat_rows = conn.execute(
                 "SELECT latency_ms FROM events WHERE event_type='agent_router' AND latency_ms IS NOT NULL"
@@ -454,6 +472,7 @@ class ObservabilityStore:
         }
 
     def create_monthly_snapshot(self, month_key: str | None = None) -> dict[str, Any]:
+        """Saves monthly KPI snapshot from current SLA metrics."""
         month_key = month_key or datetime.now(timezone.utc).strftime("%Y-%m")
         metrics = self.sla_metrics()
         with self._connect() as conn:
@@ -487,11 +506,13 @@ class ObservabilityStore:
         return {"month_key": month_key, **metrics}
 
     def monthly_snapshots(self) -> list[dict[str, Any]]:
+        """Returns monthly snapshot history."""
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM monthly_snapshots ORDER BY month_key DESC").fetchall()
         return [dict(r) for r in rows]
 
     def recent_qa_pairs(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Returns recent QA records with decoded JSON fields."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM qa_pairs ORDER BY created_at DESC LIMIT ?",
@@ -506,6 +527,7 @@ class ObservabilityStore:
         return payload
 
     def session_rollups(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Returns session-level rollups joined with event counts."""
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -523,10 +545,12 @@ class ObservabilityStore:
 
 
 def _now() -> str:
+    """Returns current UTC ISO timestamp (seconds precision)."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _percentile(values: list[float], p: float) -> float:
+    """Returns percentile value from sorted latency list."""
     if not values:
         return 0.0
     if p <= 0:

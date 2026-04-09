@@ -32,15 +32,18 @@ class TranslationResult:
 
 class TranslationService:
     def __init__(self, ttl_seconds: int = 600) -> None:
+        """Initializes translation cache."""
         self._cache: TTLCache[TranslationResult] = TTLCache(ttl_seconds=ttl_seconds, max_size=2048)
 
     def normalize_language(self, language: str | None) -> str:
+        """Normalizes language code to supported set (`en`, `fr`)."""
         if not language:
             return "en"
         lang = language.lower().strip()
         return lang if lang in _SUPPORTED else "en"
 
     def translate(self, text: str, source_language: str, target_language: str) -> TranslationResult:
+        """Performs cached dictionary translation between supported languages."""
         src = self.normalize_language(source_language)
         dst = self.normalize_language(target_language)
         if src == dst:
@@ -57,6 +60,7 @@ class TranslationService:
         return payload
 
     def stats(self) -> dict[str, int]:
+        """Returns translation cache stats."""
         stats = self._cache.stats()
         return {
             "hits": stats.hits,
@@ -66,6 +70,7 @@ class TranslationService:
         }
 
     def _translate_with_dictionary(self, text: str, source_language: str, target_language: str) -> str:
+        """Applies phrase-level mapping rules for simple translation fallback."""
         mapping = _TRANSLATION_MAP_EN_TO_FR if source_language == "en" and target_language == "fr" else _TRANSLATION_MAP_FR_TO_EN
         output = text
         for src, dst in mapping.items():

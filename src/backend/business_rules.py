@@ -91,6 +91,7 @@ TOPIC_TAXONOMY: dict[str, tuple[str, ...]] = {
 
 
 def normalize_filter(value: str | None) -> str | None:
+    """Normalizes optional filter values by trimming and handling empty input."""
     if not value:
         return None
     normalized = value.strip()
@@ -99,12 +100,14 @@ def normalize_filter(value: str | None) -> str | None:
 
 def infer_wave_year(variable_name: str) -> str:
     # PMG16_..., PMG22_..., etc.
+    """Derives survey year from PMG variable naming convention."""
     if variable_name.startswith("PMG") and len(variable_name) >= 5 and variable_name[3:5].isdigit():
         return f"20{variable_name[3:5]}"
     return "Unknown"
 
 
 def infer_survey_name(variable_name: str) -> str:
+    """Derives survey key prefix from variable ID."""
     if variable_name == "Survey_Name":
         return "Survey Metadata"
     parts = variable_name.split("_")
@@ -114,6 +117,7 @@ def infer_survey_name(variable_name: str) -> str:
 
 
 def is_valid_question_text(text: str) -> bool:
+    """Filters invalid/system rows from retrieval corpus."""
     stripped = text.strip()
     if not stripped:
         return False
@@ -128,6 +132,7 @@ def apply_filters(
     topic_label: str | None = None,
     topic_source_type: str | None = None,
 ) -> list[QuestionRecord]:
+    """Applies deterministic filtering over candidate records."""
     survey_name = normalize_filter(survey_name)
     wave_year = normalize_filter(wave_year)
     topic_label = normalize_filter(topic_label)
@@ -153,6 +158,7 @@ def apply_filters(
 
 
 def categorize_question_labels(question_text: str, value_labels: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Maps question/value text into taxonomy labels and label-source metadata."""
     question_text_lower = question_text.lower()
     values_text_lower = " ".join(value_labels).lower()
     labels: list[str] = []
@@ -178,6 +184,7 @@ def categorize_question_labels(question_text: str, value_labels: list[str]) -> t
 
 
 def build_grounded_context(records: list[QuestionRecord]) -> str:
+    """Builds compact grounded context text used for LLM summarization."""
     lines: list[str] = []
     for idx, record in enumerate(records, start=1):
         lines.append(f"[{idx}] {record.question_id} | {record.question_text}")

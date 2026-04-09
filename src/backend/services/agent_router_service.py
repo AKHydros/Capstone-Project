@@ -76,6 +76,7 @@ class AgentRouterService:
         llm_health_service: LlmHealthService,
         default_mode: str = "hybrid",
     ) -> None:
+        """Wires chatbot, safety, translation, governance, observability, and router cache."""
         self.chatbot_service = chatbot_service
         self.store = store
         self.logger = logger
@@ -87,6 +88,7 @@ class AgentRouterService:
         self.query_cache: TTLCache[dict[str, Any]] = TTLCache(ttl_seconds=300, max_size=2048)
 
     def handle(self, request: AgentRouterInput) -> AgentRouterOutput:
+        """Main routing pipeline: consent, safety, cache, route decision, answer generation, telemetry, governance persistence."""
         started = time.perf_counter()
         trace_id = request.trace_id or str(uuid4())
         language = self.translation_service.normalize_language(request.language)
@@ -303,6 +305,7 @@ class AgentRouterService:
         return output
 
     def _record_qa(self, request: AgentRouterInput, query_en: str, output: AgentRouterOutput) -> None:
+        """Persists redacted QA pair for traceability."""
         self.store.record_qa_pair(
             trace_id=output.trace_id,
             session_id=request.session_id,
@@ -323,6 +326,7 @@ class AgentRouterService:
         payload: dict[str, Any],
         include_content: bool,
     ) -> None:
+        """Writes structured event to DB and JSON logger."""
         event_payload: dict[str, Any] = {
             "mode": request.mode,
             "filters": request.filters or {},
@@ -376,6 +380,7 @@ class AgentRouterService:
         llm_model: str | None,
         inference: dict[str, int | float],
     ) -> str:
+        """Builds deterministic router-response cache key from request dimensions."""
         payload = {
             "q": query_en,
             "f": filters,
@@ -389,6 +394,7 @@ class AgentRouterService:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _decide_route(self, mode: str) -> tuple[str, bool]:
+        """Chooses deterministic vs LLM route based on mode and health."""
         health = self.llm_health_service.status()
         llm_available = self.chatbot_service.llm_client.enabled and health.status == "Connected"
 
@@ -404,6 +410,7 @@ class AgentRouterService:
         return "deterministic", True
 
     def _to_card(self, record: QuestionRecord) -> ResultCard:
+        """Maps `QuestionRecord` to API response card shape."""
         return ResultCard(
             question_id=record.question_id,
             question_text=record.question_text,

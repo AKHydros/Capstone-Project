@@ -26,6 +26,7 @@ class SemanticRetriever:
 
     @classmethod
     def build(cls, records: list[QuestionRecord], chunks: list[TextChunk]) -> "SemanticRetriever":
+        """Builds semantic representation using OpenAI embeddings or local TF-IDF fallback."""
         texts = [c.text for c in chunks]
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
 
@@ -54,10 +55,12 @@ class SemanticRetriever:
         return cls(records=records, chunks=chunks, matrix=matrix, mode="local", vectorizer=vectorizer)
 
     def score(self, query: str) -> list[float]:
+        """Returns semantic scores only."""
         sims, _ = self.score_with_meta(query)
         return sims
 
     def score_with_meta(self, query: str) -> tuple[list[float], bool]:
+        """Returns semantic scores plus embedding-cache-hit metadata."""
         if self.mode == "openai":
             assert self.embedding_model is not None
             api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -84,6 +87,7 @@ class SemanticRetriever:
         return sims.tolist(), False
 
     def embedding_cache_stats(self) -> CacheStats:
+        """Returns embedding query cache counters."""
         if self.query_embedding_cache is None:
             return CacheStats(hits=0, misses=0, expired=0, size=0)
         return self.query_embedding_cache.stats()
@@ -91,10 +95,12 @@ class SemanticRetriever:
 
 @lru_cache(maxsize=1)
 def _openai_client(api_key: str) -> OpenAI:
+    """Returns memoized OpenAI client for embedding calls."""
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY must be set for OpenAI semantic mode")
     return OpenAI(api_key=api_key)
 
 
 def _normalize_query(query: str) -> str:
+    """Module helper to normalize query strings for cache keys."""
     return " ".join(query.lower().split())

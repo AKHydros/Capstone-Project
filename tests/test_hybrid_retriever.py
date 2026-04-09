@@ -9,20 +9,24 @@ from backend.retrieval.pipeline import TextChunk
 
 class _FailingSemantic:
     def score_with_meta(self, query: str) -> tuple[list[float], bool]:
+        """Simulate a semantic backend outage by raising at scoring time."""
         del query
         raise RuntimeError("semantic backend unavailable")
 
 
 class _StaticLexical:
     def __init__(self, scores: list[float]) -> None:
+        """Store fixed lexical scores so ranking behavior is deterministic."""
         self._scores = scores
 
     def score(self, query: str) -> list[float]:
+        """Return preconfigured lexical scores regardless of query content."""
         del query
         return self._scores
 
 
 def _record(question_id: str, text: str) -> QuestionRecord:
+    """Build a minimal `QuestionRecord` fixture for retrieval fallback testing."""
     return QuestionRecord(
         question_id=question_id,
         question_text=text,
@@ -39,6 +43,7 @@ def _record(question_id: str, text: str) -> QuestionRecord:
 
 class HybridRetrieverFailureFallbackTests(unittest.TestCase):
     def test_semantic_failure_falls_back_to_lexical_scores(self) -> None:
+        """Assert lexical scores still rank results when semantic scoring fails."""
         records = [
             _record("PMG20_GAM_q12a", "Consolidated number of financial companies you use"),
             _record("PMG20_GAM_q12b", "Switched financial companies"),

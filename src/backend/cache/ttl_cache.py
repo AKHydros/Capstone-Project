@@ -19,6 +19,7 @@ class CacheStats:
 
 class TTLCache(Generic[T]):
     def __init__(self, ttl_seconds: int = 300, max_size: int = 1024) -> None:
+        """Creates bounded in-memory TTL cache with thread lock and counters."""
         self.ttl_seconds = ttl_seconds
         self.max_size = max_size
         self._store: dict[str, tuple[float, T]] = {}
@@ -29,6 +30,7 @@ class TTLCache(Generic[T]):
 
     def __getstate__(self) -> dict[str, object]:
         # Locks are not pickleable; serialize only data fields.
+        """Serializes cache state without non-pickleable lock."""
         return {
             "ttl_seconds": self.ttl_seconds,
             "max_size": self.max_size,
@@ -39,6 +41,7 @@ class TTLCache(Generic[T]):
         }
 
     def __setstate__(self, state: dict[str, object]) -> None:
+        """Restores serialized cache state and recreates lock."""
         self.ttl_seconds = int(state.get("ttl_seconds", 300))
         self.max_size = int(state.get("max_size", 1024))
         self._store = dict(state.get("_store", {}))
@@ -48,6 +51,7 @@ class TTLCache(Generic[T]):
         self._lock = threading.Lock()
 
     def get(self, key: str) -> T | None:
+        """Reads non-expired value and updates hit/miss/expired counters."""
         now = time.time()
         with self._lock:
             item = self._store.get(key)
@@ -64,6 +68,7 @@ class TTLCache(Generic[T]):
             return value
 
     def set(self, key: str, value: T) -> None:
+        """Inserts value with expiration and evicts oldest if full."""
         expires_at = time.time() + self.ttl_seconds
         with self._lock:
             if len(self._store) >= self.max_size:
@@ -72,10 +77,12 @@ class TTLCache(Generic[T]):
             self._store[key] = (expires_at, value)
 
     def clear(self) -> None:
+        """Removes all cached entries."""
         with self._lock:
             self._store.clear()
 
     def stats(self) -> CacheStats:
+        """Returns cache statistics snapshot."""
         with self._lock:
             return CacheStats(
                 hits=self._hits,

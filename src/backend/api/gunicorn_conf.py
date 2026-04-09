@@ -5,6 +5,7 @@ import os
 
 
 def _int_env(name: str, default: int, *, min_value: int, max_value: int | None = None) -> int:
+    """Safely parses and clamps integer env vars for gunicorn settings."""
     raw = os.getenv(name, "").strip()
     if not raw:
         return default

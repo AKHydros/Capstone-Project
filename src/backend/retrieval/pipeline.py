@@ -20,6 +20,7 @@ def ingest_clean_chunk(
     chunk_size: int = 720,
     overlap: int = 120,
 ) -> list[TextChunk]:
+    """Converts records into cleaned overlapping text chunks for indexing."""
     chunks: list[TextChunk] = []
     for record_index, record in enumerate(records):
         cleaned = _clean_text(record.document_text)
@@ -39,11 +40,13 @@ def ingest_clean_chunk(
 
 
 def _clean_text(text: str) -> str:
+    """Normalizes whitespace in source text."""
     compact = re.sub(r"\s+", " ", text).strip()
     return compact
 
 
 def _chunk_text(text: str, *, chunk_size: int, overlap: int) -> list[str]:
+    """Splits text into chunk windows with overlap."""
     if not text:
         return []
     if len(text) <= chunk_size:
