@@ -745,6 +745,8 @@ with header_menu_col:
         st.write(llm_badge)
         if llm_health.get("last_check_time"):
             st.caption(f"Checked: {_format_timestamp_et(str(llm_health.get('last_check_time')))}")
+        if llm_health.get("error_summary"):
+            st.caption(f"Reason: {llm_health.get('error_summary')}")
 
         st.markdown("#### Client Mode")
         st.write(f"**{deployment_mode}**")

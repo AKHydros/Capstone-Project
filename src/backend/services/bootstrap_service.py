@@ -9,6 +9,7 @@ from ..cache.index_cache import CacheInspectResult, IndexCache, build_signature
 from ..config import AppConfig
 from ..observability import JsonEventLogger, ObservabilityStore
 from ..llm.openai_client import OpenAIChatClient
+from ..llm.key_utils import resolve_openai_api_key
 from ..loaders.excel_repository import ExcelRepository
 from ..loaders.survey_prompt_loader import SurveyPromptLoader
 from ..retrieval.hybrid import HybridRetriever
@@ -62,7 +63,7 @@ class BootstrapService:
         cache = IndexCache(self.config.index_cache_dir)
 
         embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-        has_openai_key = bool(os.getenv("OPENAI_API_KEY", "").strip())
+        has_openai_key = bool(resolve_openai_api_key())
         rules_fingerprint = (
             f"{RETRIEVAL_RULES.lexical_weight}:"
             f"{RETRIEVAL_RULES.semantic_weight}:"

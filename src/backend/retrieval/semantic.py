@@ -10,6 +10,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from ..cache.ttl_cache import CacheStats, TTLCache
+from ..llm.key_utils import resolve_openai_api_key
 from ..models import QuestionRecord
 from .pipeline import TextChunk
 
@@ -28,7 +29,7 @@ class SemanticRetriever:
     def build(cls, records: list[QuestionRecord], chunks: list[TextChunk]) -> "SemanticRetriever":
         """Builds semantic representation using OpenAI embeddings or local TF-IDF fallback."""
         texts = [c.text for c in chunks]
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        api_key = resolve_openai_api_key()
 
         if api_key:
             model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
@@ -97,7 +98,7 @@ class SemanticRetriever:
         """
         if self.mode == "openai":
             assert self.embedding_model is not None
-            api_key = os.getenv("OPENAI_API_KEY", "").strip()
+            api_key = resolve_openai_api_key()
             query_key = _normalize_query(query)
             emb: list[float] | None = None
             cache_hit = False
@@ -157,7 +158,7 @@ def _openai_client(api_key: str) -> OpenAI:
         When *api_key* is empty.
     """
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY must be set for OpenAI semantic mode")
+        raise RuntimeError("OpenAI key is required for semantic mode (set OPENAI_API_KEY or OPEN_API_KEY)")
     return OpenAI(api_key=api_key)
 
 
