@@ -728,7 +728,23 @@ class ChatbotService:
         return any(keyword in lowered for keyword in keywords)
 
     def _build_did_you_mean(self, query: str) -> list[str]:
-        """Run a broad (unfiltered) search and return up to 3 question texts as suggestions."""
+        """Run a broad, filter-free search and return up to 3 candidate question texts.
+
+        Called when the primary retrieval path returns no grounded cards.  The
+        results are surfaced in the UI as "Did you mean?" clickable chips so the
+        user can pivot to a related question without re-typing.
+
+        Parameters
+        ----------
+        query : str
+            The original user query that produced no results.
+
+        Returns
+        -------
+        list[str]
+            Up to 3 question-text strings from the top-ranked broad results.
+            Returns an empty list if the broad search also fails.
+        """
         try:
             broad = self.retriever.search_with_details(query=query)
             return [
@@ -740,14 +756,41 @@ class ChatbotService:
             return []
 
     def _is_comparison_intent(self, query: str) -> bool:
-        """Detects cross-survey comparison intent (e.g. 'compare PMG20 vs PMG22')."""
+        """Return True when the query expresses a cross-survey comparison intent.
+
+        Matches patterns such as ``"compare PMG20_WAI vs PMG22_WAI"``,
+        ``"PMG19 versus PMG21"``, or ``"compare X and Y"``.
+
+        Parameters
+        ----------
+        query : str
+            Raw user query string.
+
+        Returns
+        -------
+        bool
+        """
         lowered = query.lower()
         return bool(
             re.search(r"\bvs\.?\b|\bversus\b|\bcompare\b.*\bvs\b|\bcompare\b.*\band\b", lowered)
         )
 
     def _extract_two_surveys(self, query: str) -> tuple[str, str] | None:
-        """Returns the first two distinct survey tokens found in a query, or None."""
+        """Extract the first two distinct PMG survey tokens from a query string.
+
+        Matches tokens of the form ``PMG{YY}_{XXX}`` (e.g. ``PMG22_WAI``).
+
+        Parameters
+        ----------
+        query : str
+            User query, expected to contain two survey identifiers.
+
+        Returns
+        -------
+        tuple[str, str] | None
+            A ``(survey_a, survey_b)`` pair (upper-cased), or ``None`` if fewer
+            than two distinct tokens are found.
+        """
         tokens = re.findall(r"\b[A-Za-z]{3}\d{2}_[A-Za-z]{3}\b", query, re.IGNORECASE)
         unique = list(dict.fromkeys(t.upper() for t in tokens))
         if len(unique) >= 2:
@@ -763,7 +806,34 @@ class ChatbotService:
         topic_label: str | None,
         topic_source_type: str | None,
     ) -> ChatResponse:
-        """Run two searches and format a side-by-side comparison table."""
+        """Fetch top results for two surveys and format a side-by-side comparison.
+
+        Runs two independent ``retriever.search_with_details()`` calls — one per
+        survey — then merges the results into a single markdown block with one
+        section per survey.  Returns ``answer_mode="comparison"`` so the UI can
+        render the ``⚖️ Cross-Survey Comparison`` badge.
+
+        Parameters
+        ----------
+        query : str
+            The user's original comparison query.
+        survey_a : str
+            First survey token (e.g. ``"PMG20_WAI"``).
+        survey_b : str
+            Second survey token (e.g. ``"PMG22_WAI"``).
+        wave_year : str | None
+            Optional wave-year filter applied to both searches.
+        topic_label : str | None
+            Optional topic-label filter applied to both searches.
+        topic_source_type : str | None
+            Optional topic-source-type filter applied to both searches.
+
+        Returns
+        -------
+        ChatResponse
+            Combined answer with ``answer_mode="comparison"`` and records from
+            both surveys in ``ranked_results``.
+        """
         def _top_text(survey: str) -> str:
             search = self.retriever.search_with_details(
                 query=query,
