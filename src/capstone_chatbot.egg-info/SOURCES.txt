@@ -7,6 +7,7 @@ src/backend/models.py
 src/backend/api/__init__.py
 src/backend/api/app.py
 src/backend/api/client.py
+src/backend/api/gunicorn_conf.py
 src/backend/api/schemas.py
 src/backend/cache/__init__.py
 src/backend/cache/index_cache.py
@@ -22,6 +23,7 @@ src/backend/observability/json_logger.py
 src/backend/retrieval/__init__.py
 src/backend/retrieval/hybrid.py
 src/backend/retrieval/lexical.py
+src/backend/retrieval/pipeline.py
 src/backend/retrieval/semantic.py
 src/backend/services/__init__.py
 src/backend/services/agent_router_service.py
@@ -39,4 +41,9 @@ src/capstone_chatbot.egg-info/requires.txt
 src/capstone_chatbot.egg-info/top_level.txt
 src/ui/__init__.py
 src/ui/app.py
+src/ui/chat_utils.py
 src/ui/style.py
+tests/test_chatbot_service.py
+tests/test_conversational_upgrade.py
+tests/test_hybrid_retriever.py
+tests/test_rag_upgrade.py

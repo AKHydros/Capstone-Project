@@ -55,12 +55,46 @@ class SemanticRetriever:
         return cls(records=records, chunks=chunks, matrix=matrix, mode="local", vectorizer=vectorizer)
 
     def score(self, query: str) -> list[float]:
-        """Returns semantic scores only."""
+        """Return semantic similarity scores for *query* against all chunks.
+
+        Convenience wrapper around :meth:`score_with_meta` that discards the
+        cache-hit flag.
+
+        Parameters
+        ----------
+        query:
+            User query string.
+
+        Returns
+        -------
+        list[float]
+            Per-chunk cosine similarity scores, same order as ``self.chunks``.
+        """
         sims, _ = self.score_with_meta(query)
         return sims
 
     def score_with_meta(self, query: str) -> tuple[list[float], bool]:
-        """Returns semantic scores plus embedding-cache-hit metadata."""
+        """Return semantic similarity scores and an embedding cache-hit flag.
+
+        In ``openai`` mode the query is embedded via the OpenAI API (or
+        returned from a TTL cache) and compared against the pre-built embedding
+        matrix with a dot-product (valid because both sides are L2-normalised).
+
+        In ``local`` mode a char-ngram TF-IDF cosine similarity is used
+        instead — no API calls, no caching.
+
+        Parameters
+        ----------
+        query:
+            User query string.
+
+        Returns
+        -------
+        tuple[list[float], bool]
+            ``(scores, cache_hit)`` where *scores* are per-chunk similarity
+            values and *cache_hit* is ``True`` when the query embedding was
+            served from the TTL cache.
+        """
         if self.mode == "openai":
             assert self.embedding_model is not None
             api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -87,7 +121,14 @@ class SemanticRetriever:
         return sims.tolist(), False
 
     def embedding_cache_stats(self) -> CacheStats:
-        """Returns embedding query cache counters."""
+        """Return TTL-cache counters for the query embedding cache.
+
+        Returns
+        -------
+        CacheStats
+            Hit/miss/expired/size counts.  Returns all-zero stats when
+            the retriever is in ``local`` mode (no cache used).
+        """
         if self.query_embedding_cache is None:
             return CacheStats(hits=0, misses=0, expired=0, size=0)
         return self.query_embedding_cache.stats()
@@ -95,12 +136,42 @@ class SemanticRetriever:
 
 @lru_cache(maxsize=1)
 def _openai_client(api_key: str) -> OpenAI:
-    """Returns memoized OpenAI client for embedding calls."""
+    """Return a memoized :class:`openai.OpenAI` client for embedding calls.
+
+    The client is cached for the process lifetime because constructing it
+    involves SSL setup and connection-pool initialisation.
+
+    Parameters
+    ----------
+    api_key:
+        OpenAI API key string.  Must be non-empty.
+
+    Returns
+    -------
+    OpenAI
+        Configured client instance.
+
+    Raises
+    ------
+    RuntimeError
+        When *api_key* is empty.
+    """
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY must be set for OpenAI semantic mode")
     return OpenAI(api_key=api_key)
 
 
 def _normalize_query(query: str) -> str:
-    """Module helper to normalize query strings for cache keys."""
+    """Return a whitespace-collapsed, lower-cased query string for cache keys.
+
+    Parameters
+    ----------
+    query:
+        Raw query string.
+
+    Returns
+    -------
+    str
+        Lower-cased and whitespace-normalised form of *query*.
+    """
     return " ".join(query.lower().split())

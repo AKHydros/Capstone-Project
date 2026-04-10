@@ -68,11 +68,14 @@ def citation_markers(sources: list[dict[str, object]], *, max_markers: int = 4) 
 
 
 def confidence_badge(confidence_score: float | None) -> str:
-    """Returns user-facing confidence bucket label."""
+    """Returns user-facing confidence label with percentage and plain-language description."""
     if confidence_score is None:
-        return "Confidence: N/A"
+        return "Match quality: exact lookup"
+    pct = f"{confidence_score:.0%}"
     if confidence_score >= 0.75:
-        return f"Confidence: High ({confidence_score:.2f})"
+        return f"Match quality: High ({pct}) — strong retrieval match"
     if confidence_score >= 0.45:
-        return f"Confidence: Medium ({confidence_score:.2f})"
-    return f"Confidence: Low ({confidence_score:.2f})"
+        return f"Match quality: Medium ({pct}) — good retrieval match"
+    if confidence_score >= 0.25:
+        return f"Match quality: Low ({pct}) — partial match, review results"
+    return f"Match quality: Very low ({pct}) — consider rephrasing your query"

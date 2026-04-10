@@ -127,8 +127,14 @@ class RagUpgradeTests(unittest.TestCase):
         self.assertTrue(second.answer_cache_hit)
         self.assertEqual(llm.calls, 1)
 
-    def test_answer_cache_is_context_aware(self) -> None:
-        """Assert changing conversation context bypasses cached answers for the same query."""
+    def test_answer_cache_is_stable_across_conversation_contexts(self) -> None:
+        """Assert same query + same records returns a cache hit regardless of conversation context.
+
+        Conversation context was previously part of the cache key, causing a
+        100% cache-miss rate.  Answers are grounded in retrieved records, not
+        prior turns, so the cache key now excludes context — the second call
+        should hit the cache and not invoke the LLM again.
+        """
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
             retriever = HybridRetriever.build(make_records())
         llm = StubLlmClient()
@@ -160,8 +166,8 @@ class RagUpgradeTests(unittest.TestCase):
             )
 
         self.assertFalse(first.answer_cache_hit)
-        self.assertFalse(second.answer_cache_hit)
-        self.assertEqual(llm.calls, 2)
+        self.assertTrue(second.answer_cache_hit)   # cache hit — context no longer invalidates
+        self.assertEqual(llm.calls, 1)             # LLM called only once
 
 
 if __name__ == "__main__":

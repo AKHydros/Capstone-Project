@@ -253,6 +253,7 @@ class ApiClient:
             "needs_clarification": output.needs_clarification,
             "unanswered_reason": output.unanswered_reason,
             "fallback_reason": output.fallback_reason,
+            "follow_up_suggestion": output.follow_up_suggestion,
         }
 
     def _local_compliance_status(self) -> dict[str, Any]:

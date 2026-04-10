@@ -79,6 +79,7 @@ class AgentRouterOutput:
     needs_clarification: bool
     unanswered_reason: str | None
     fallback_reason: str | None
+    follow_up_suggestion: str | None = None
 
 
 class AgentRouterService:
@@ -156,6 +157,8 @@ class AgentRouterService:
             return output
 
         translated_query = self.translation_service.translate(request.query, source_language=language, target_language="en")
+
+        # --- Safety check (absolute violations) ---
         safety_result = self.safety_service.check_user_query(translated_query.text)
         if not safety_result.allowed:
             blocked_message = "I cannot assist with that request due to safety policy."
@@ -191,6 +194,55 @@ class AgentRouterService:
                 session_id=request.session_id,
                 user_role=normalized_role,
                 reason="no_cards",
+                query_text=self.safety_service.redact_pii(request.query),
+            )
+            return output
+
+        # --- Domain constraint check ---
+        # Rejects questions that are clearly outside the market-research
+        # data dictionary scope before any retrieval is attempted.
+        domain_result = self.safety_service.check_domain(translated_query.text)
+        if not domain_result.allowed:
+            out_of_domain_message = (
+                "I can only answer questions about the PMG market research data dictionary — "
+                "survey variables, question labels, coded values, topic mappings, and related metadata. "
+                "Your question appears to be outside that scope. "
+                "Please try asking about a specific survey variable, question ID, or research topic."
+            )
+            translated_ood = self.translation_service.translate(
+                out_of_domain_message, source_language="en", target_language=language
+            )
+            latency_ms = (time.perf_counter() - started) * 1000
+            output = AgentRouterOutput(
+                trace_id=trace_id,
+                route_used="domain_block",
+                response=translated_ood.text,
+                language_out=language,
+                fallback_used=True,
+                retrieval_mode="deterministic",
+                confidence_score=None,
+                cache_status={"embedding_cache_hit": False, "answer_cache_hit": False},
+                labels=["Out-of-Domain"],
+                takeaways=["Query rejected: outside market-research dictionary scope."],
+                latency_ms=round(latency_ms, 2),
+                cards=[],
+                sources=[],
+                answer_mode="direct_answer",
+                needs_clarification=False,
+                unanswered_reason="out_of_domain",
+                fallback_reason="domain_constraint",
+            )
+            self._record_event(
+                request,
+                output,
+                payload={"reason": domain_result.reason, "user_role": normalized_role},
+                include_content=True,
+            )
+            self.store.record_unanswered(
+                trace_id=trace_id,
+                session_id=request.session_id,
+                user_role=normalized_role,
+                reason="out_of_domain",
                 query_text=self.safety_service.redact_pii(request.query),
             )
             return output
@@ -242,6 +294,11 @@ class AgentRouterService:
                 fallback_reason=(
                     str(cached_payload["fallback_reason"])
                     if cached_payload.get("fallback_reason") is not None
+                    else None
+                ),
+                follow_up_suggestion=(
+                    str(cached_payload["follow_up_suggestion"])
+                    if cached_payload.get("follow_up_suggestion")
                     else None
                 ),
             )
@@ -337,8 +394,9 @@ class AgentRouterService:
             sources=sources,
             answer_mode=response_payload.answer_mode,
             needs_clarification=response_payload.needs_clarification,
-            unanswered_reason=unanswered_reason,
-            fallback_reason=fallback_reason,
+            unanswered_reason=unanswered_reason or None,
+            fallback_reason=fallback_reason or None,
+            follow_up_suggestion=response_payload.follow_up_suggestion,
         )
 
         self.query_cache.set(
@@ -361,6 +419,7 @@ class AgentRouterService:
                 "needs_clarification": output.needs_clarification,
                 "unanswered_reason": output.unanswered_reason,
                 "fallback_reason": output.fallback_reason,
+                "follow_up_suggestion": output.follow_up_suggestion,
             },
         )
 
@@ -426,21 +485,27 @@ class AgentRouterService:
         payload: dict[str, Any],
         include_content: bool,
     ) -> None:
-        """Writes structured event to DB and JSON logger."""
+        """Writes structured event to DB and JSON logger.
+
+        Empty strings are normalized to None so that analytics queries can
+        reliably use IS NULL / IS NOT NULL rather than mixed empty-string checks.
+        """
         event_payload: dict[str, Any] = {
             "mode": request.mode,
             "filters": request.filters or {},
             "llm_provider": request.llm_provider,
-            "llm_model": request.llm_model,
+            "llm_model": request.llm_model or None,
             "inference": request.inference or {},
             "input_method": request.input_method,
-            "retrieval_mode": output.retrieval_mode,
+            "retrieval_mode": output.retrieval_mode or None,
+            # Always log the raw confidence score regardless of retrieval path so
+            # deterministic responses are also observable in analytics.
             "confidence_score": output.confidence_score,
             "cache_status": output.cache_status,
-            "answer_mode": output.answer_mode,
+            "answer_mode": output.answer_mode or None,
             "needs_clarification": output.needs_clarification,
-            "unanswered_reason": output.unanswered_reason,
-            "fallback_reason": output.fallback_reason,
+            "unanswered_reason": output.unanswered_reason or None,
+            "fallback_reason": output.fallback_reason or None,
             "user_role": request.user_role,
             **payload,
         }

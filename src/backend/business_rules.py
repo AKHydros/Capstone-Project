@@ -99,15 +99,45 @@ def normalize_filter(value: str | None) -> str | None:
 
 
 def infer_wave_year(variable_name: str) -> str:
-    # PMG16_..., PMG22_..., etc.
-    """Derives survey year from PMG variable naming convention."""
+    """Derive the four-digit survey year from a PMG variable ID.
+
+    PMG variable IDs follow the convention ``PMG{YY}_{SURVEY}_q{N}`` where
+    ``{YY}`` is the two-digit year suffix (e.g. ``16`` → ``2016``).
+
+    Parameters
+    ----------
+    variable_name:
+        Raw variable ID string, e.g. ``"PMG22_WAI_q5a"``.
+
+    Returns
+    -------
+    str
+        Four-digit year string, e.g. ``"2022"``, or ``"Unknown"`` when the
+        naming convention cannot be matched.
+    """
     if variable_name.startswith("PMG") and len(variable_name) >= 5 and variable_name[3:5].isdigit():
         return f"20{variable_name[3:5]}"
     return "Unknown"
 
 
 def infer_survey_name(variable_name: str) -> str:
-    """Derives survey key prefix from variable ID."""
+    """Derive the survey key prefix from a variable ID.
+
+    For ``PMG22_WAI_q5a`` this returns ``"PMG22_WAI"``.
+
+    Parameters
+    ----------
+    variable_name:
+        Raw variable ID string.
+
+    Returns
+    -------
+    str
+        The first two underscore-delimited segments joined by ``_``, or
+        ``"Unknown"`` for variables with fewer than two segments.
+        ``"Survey_Name"`` is treated as a special sentinel and mapped to
+        ``"Survey Metadata"``.
+    """
     if variable_name == "Survey_Name":
         return "Survey Metadata"
     parts = variable_name.split("_")
@@ -117,11 +147,24 @@ def infer_survey_name(variable_name: str) -> str:
 
 
 def is_valid_question_text(text: str) -> bool:
-    """Filters invalid/system rows from retrieval corpus."""
+    """Return ``True`` when *text* is a usable question label.
+
+    Filters out empty strings and known system-field labels (e.g.
+    ``"Unique Identifier"``, ``"Date Started"``) that appear in the Excel
+    source but should never be surfaced in the chatbot.
+
+    Parameters
+    ----------
+    text:
+        Raw label string from the Excel ``Variable Information`` sheet.
+
+    Returns
+    -------
+    bool
+    """
     stripped = text.strip()
     if not stripped:
         return False
-    # Remove clear system fields from question retrieval experience.
     return stripped.lower() not in {"unique identifier", "date started", "date completed"}
 
 
@@ -132,7 +175,33 @@ def apply_filters(
     topic_label: str | None = None,
     topic_source_type: str | None = None,
 ) -> list[QuestionRecord]:
-    """Applies deterministic filtering over candidate records."""
+    """Apply deterministic equality filters over a stream of records.
+
+    All filter values are normalised (stripped, ``None``-ified if empty)
+    before comparison.  A ``None`` filter value means "no constraint" and is
+    skipped entirely.
+
+    Parameters
+    ----------
+    records:
+        Iterable of :class:`~backend.models.QuestionRecord` to filter.
+    survey_name:
+        If set, only records whose ``survey_name`` matches exactly are kept.
+    wave_year:
+        If set, only records whose ``wave_year`` matches exactly are kept.
+    topic_label:
+        If set, only records whose ``topic_labels`` list contains this value
+        are kept.
+    topic_source_type:
+        If set alongside *topic_label*, filters by the source attribution for
+        that specific topic.  If set without *topic_label*, filters records
+        where any topic has this source type.
+
+    Returns
+    -------
+    list[QuestionRecord]
+        Filtered records in original iteration order.
+    """
     survey_name = normalize_filter(survey_name)
     wave_year = normalize_filter(wave_year)
     topic_label = normalize_filter(topic_label)
@@ -158,7 +227,29 @@ def apply_filters(
 
 
 def categorize_question_labels(question_text: str, value_labels: list[str]) -> tuple[list[str], dict[str, str]]:
-    """Maps question/value text into taxonomy labels and label-source metadata."""
+    """Map a question and its value labels to taxonomy topics and source metadata.
+
+    Iterates ``TOPIC_TAXONOMY`` and checks whether each topic's keywords appear
+    in the question text, in the combined value-label text, or in both.  The
+    ``source`` attribute records which text source triggered the match
+    (``"Question Text"``, ``"Value Labels"``, or ``"Both"``).
+
+    If no taxonomy topic matches, the record is assigned the fallback topic
+    ``"General"`` with source ``"Fallback"``.
+
+    Parameters
+    ----------
+    question_text:
+        The human-readable question label from the Excel source.
+    value_labels:
+        List of coded value-label strings for this question.
+
+    Returns
+    -------
+    tuple[list[str], dict[str, str]]
+        ``(labels, sources)`` where *labels* is an ordered list of matched
+        topic names and *sources* maps each topic name to its match source.
+    """
     question_text_lower = question_text.lower()
     values_text_lower = " ".join(value_labels).lower()
     labels: list[str] = []
@@ -184,7 +275,28 @@ def categorize_question_labels(question_text: str, value_labels: list[str]) -> t
 
 
 def build_grounded_context(records: list[QuestionRecord]) -> str:
-    """Builds compact grounded context text used for LLM summarization."""
+    """Build a compact, numbered context block for LLM summarization prompts.
+
+    Each record is formatted as two lines:
+
+    .. code-block:: text
+
+        [1] PMG22_WAI_q5a | Do you currently have a financial plan?
+             survey=PMG22_WAI, wave=2022, topics=Financial Planning (Both), values=1: Yes | 2: No
+
+    The format keeps the context concise while preserving all metadata needed
+    for grounded synthesis and citation generation.
+
+    Parameters
+    ----------
+    records:
+        Ordered list of :class:`~backend.models.QuestionRecord` to include.
+
+    Returns
+    -------
+    str
+        Multi-line context block ready to be injected into an LLM prompt.
+    """
     lines: list[str] = []
     for idx, record in enumerate(records, start=1):
         lines.append(f"[{idx}] {record.question_id} | {record.question_text}")

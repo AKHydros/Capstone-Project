@@ -144,7 +144,32 @@ class HybridRetriever:
         topic_source_type: str | None = None,
         top_k: int | None = None,
     ) -> list[QuestionRecord]:
-        """Convenience wrapper returning only ranked records."""
+        """Return ranked :class:`~backend.models.QuestionRecord` objects for *query*.
+
+        Convenience wrapper around :meth:`search_with_details` that discards
+        diagnostics and returns only the ordered record list.
+
+        Parameters
+        ----------
+        query:
+            User query string.
+        survey_name:
+            Optional survey-name filter applied after scoring.
+        wave_year:
+            Optional wave/year filter applied after scoring.
+        topic_label:
+            Optional topic-label filter applied after scoring.
+        topic_source_type:
+            Optional topic-source-type filter applied after scoring.
+        top_k:
+            Maximum number of records to return.  Defaults to
+            ``RETRIEVAL_RULES.top_k``.
+
+        Returns
+        -------
+        list[QuestionRecord]
+            Ordered from highest to lowest relevance score.
+        """
         result = self.search_with_details(
             query=query,
             survey_name=survey_name,

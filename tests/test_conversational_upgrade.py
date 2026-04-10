@@ -42,7 +42,8 @@ class ConversationalUtilityTests(unittest.TestCase):
         self.assertIn("PMG20_GAM_q5a", rendered)
         self.assertEqual(citation_markers(history[1]["sources"]), "[1]")
         self.assertIn("High", confidence_badge(0.81))
-        self.assertIn("Low", confidence_badge(0.12))
+        # 0.12 is below the 0.25 floor so the badge now reads "Very low"
+        self.assertIn("low", confidence_badge(0.12).lower())
 
 
 class RoleAndAnalyticsTests(unittest.TestCase):

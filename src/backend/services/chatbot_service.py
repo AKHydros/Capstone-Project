@@ -129,7 +129,10 @@ class ChatbotService:
 
         if not cards:
             return ChatResponse(
-                answer="I could not find grounded matches in the current Excel dictionary. Try broader wording or relax filters.",
+                answer=_sanitize_answer(
+                    "I could not find grounded matches in the current data dictionary. "
+                    "Try broader wording, remove filters, or check the question ID format."
+                ),
                 ranked_results=[],
                 retrieval_mode="deterministic",
                 answer_mode="direct_answer",
@@ -166,6 +169,7 @@ class ChatbotService:
         )
         cached_answer = self.answer_cache.get(answer_cache_key)
         if cached_answer is not None and str(cached_answer.get("cache_type", "")) == "hybrid_answer":
+            raw_follow_up = cached_answer.get("follow_up_suggestion")
             return ChatResponse(
                 answer=str(cached_answer.get("answer", "")),
                 ranked_results=cards,
@@ -177,29 +181,43 @@ class ChatbotService:
                 confidence_score=confidence,
                 embedding_cache_hit=embedding_cache_hit,
                 answer_cache_hit=True,
+                follow_up_suggestion=str(raw_follow_up) if raw_follow_up else None,
             )
 
         if should_use_llm:
             context = build_grounded_context(cards)
             conversation_block = self._conversation_context_block(conversation_context or [])
+            low_confidence_notice = (
+                "Note: retrieval confidence is below 0.50, meaning the matched records "
+                "may not be a perfect fit. Acknowledge this briefly at the start of your answer.\n\n"
+                if confidence < 0.50
+                else ""
+            )
             system_prompt = (
-                "You are a grounded research dictionary assistant. "
-                "Be conversational, direct, and quick to read. "
-                "Lead with a short answer, then add concise supporting details. "
-                "Only summarize retrieved records. Never invent question text, IDs, or surveys. "
-                "If uncertain, say so plainly."
+                "You are a grounded research data dictionary assistant for market research surveys. "
+                "Be concise, direct, and easy to read. "
+                "Only reference retrieved records — never invent question text, IDs, or survey names. "
+                "If records do not clearly match the query, say so explicitly.\n\n"
+                "Always structure your response EXACTLY as follows (use these exact headings):\n\n"
+                "**Answer:** [Direct answer in 1–2 sentences]\n\n"
+                "**Key Details:**\n"
+                "- [Supporting detail 1]\n"
+                "- [Supporting detail 2]\n"
+                "- [Supporting detail 3, if applicable]\n\n"
+                "**Suggested Follow-up:** [One follow-up question the user might want to ask next]\n\n"
+                "If the user asks for allowable values or coded options, list them as a bullet list "
+                "under Key Details."
             )
             user_prompt = (
+                f"{low_confidence_notice}"
                 f"{conversation_block}"
                 f"User query: {query}\n\n"
-                f"Retrieved records:\n{context}\n\n"
-                "Return: (1) direct answer, (2) notable patterns, (3) 1 suggested follow-up query. "
-                "If the user asks for response options or allowable values, list the coded values clearly."
+                f"Retrieved records:\n{context}"
             )
             max_length = int(inference["max_length"]) if inference and "max_length" in inference else None
             top_p = float(inference["top_p"]) if inference and "top_p" in inference else None
             temperature = float(inference["temperature"]) if inference and "temperature" in inference else None
-            answer = self.llm_client.summarize(
+            raw_answer = self.llm_client.summarize(
                 system_prompt,
                 user_prompt,
                 model=llm_model,
@@ -207,8 +225,11 @@ class ChatbotService:
                 top_p=top_p,
                 temperature=temperature,
             )
+            follow_up = self._parse_follow_up_suggestion(raw_answer)
+            answer = _sanitize_answer(raw_answer)
         else:
-            answer = self._deterministic_answer(query=query, cards=cards, llm_provider=llm_provider)
+            answer = _sanitize_answer(self._deterministic_answer(query=query, cards=cards, llm_provider=llm_provider))
+            follow_up = None
 
         self.answer_cache.set(
             answer_cache_key,
@@ -218,6 +239,7 @@ class ChatbotService:
                 "retrieval_mode": retrieval_mode,
                 "answer_mode": "summary" if should_use_llm else "direct_answer",
                 "needs_clarification": False,
+                "follow_up_suggestion": follow_up,
             },
         )
 
@@ -232,6 +254,7 @@ class ChatbotService:
             confidence_score=confidence,
             embedding_cache_hit=embedding_cache_hit,
             answer_cache_hit=False,
+            follow_up_suggestion=follow_up,
         )
 
     def answer_cache_stats(self) -> CacheStats:
@@ -274,6 +297,7 @@ class ChatbotService:
             "needs_clarification": response.needs_clarification,
             "confidence_score": response.confidence_score,
             "embedding_cache_hit": response.embedding_cache_hit,
+            "follow_up_suggestion": response.follow_up_suggestion,
         }
 
     def _cached_chat_response(self, payload: dict[str, object]) -> ChatResponse | None:
@@ -302,6 +326,7 @@ class ChatbotService:
         except (TypeError, ValueError):
             parsed_variant_count = 0
 
+        raw_follow_up = payload.get("follow_up_suggestion")
         return ChatResponse(
             answer=str(payload.get("answer", "")),
             ranked_results=ranked_results,
@@ -313,6 +338,7 @@ class ChatbotService:
             confidence_score=parsed_confidence,
             embedding_cache_hit=bool(payload.get("embedding_cache_hit", False)),
             answer_cache_hit=True,
+            follow_up_suggestion=str(raw_follow_up) if raw_follow_up else None,
         )
 
     def _should_use_llm(
@@ -323,7 +349,13 @@ class ChatbotService:
         diagnostics: RetrievalDiagnostics,
         confidence: float,
     ) -> bool:
-        """Applies RAG confidence/gap logic to decide if synthesis is needed."""
+        """Applies RAG confidence/gap logic to decide if synthesis is needed.
+
+        A confidence floor of 0.25 prevents sending noisy/irrelevant records to
+        the LLM.  Below that threshold the retrieved context is too weak for
+        meaningful synthesis and a deterministic answer (with a low-confidence
+        notice) is safer and more honest than an LLM-generated response.
+        """
         if not llm_requested:
             return False
         if not self.rag_enabled:
@@ -332,6 +364,12 @@ class ChatbotService:
         explicit_synthesis = self._is_synthesis_intent(query)
         ambiguous = diagnostics.score_gap < self.rag_score_gap_threshold
         high_confidence = confidence >= self.rag_confidence_threshold and not ambiguous
+
+        # Confidence floor: never synthesize when retrieval quality is too low.
+        # The LLM cannot produce a trustworthy answer from weakly-matched records.
+        _CONFIDENCE_FLOOR = 0.25
+        if confidence < _CONFIDENCE_FLOOR and not explicit_synthesis:
+            return False
 
         if explicit_synthesis:
             return True
@@ -354,8 +392,39 @@ class ChatbotService:
             "trend",
             "why",
             "analysis",
+            "what are",
+            "tell me about",
+            "describe",
+            "overview",
+            "breakdown",
+            "how many",
+            "which surveys",
+            "across surveys",
+            "over time",
+            "difference between",
         )
         return any(keyword in lowered for keyword in keywords)
+
+    def _parse_follow_up_suggestion(self, llm_text: str) -> str | None:
+        """Extracts the 'Suggested Follow-up:' line from a structured LLM response.
+
+        Looks for the heading injected by the system prompt.  Returns None when
+        the heading is absent (e.g. the model deviated from the format).
+        """
+        for line in llm_text.splitlines():
+            stripped = line.strip()
+            # Match bold heading variants the model might produce
+            for prefix in (
+                "**Suggested Follow-up:**",
+                "**Suggested Follow-up**:",
+                "Suggested Follow-up:",
+            ):
+                if stripped.startswith(prefix):
+                    suggestion = stripped[len(prefix):].strip()
+                    # Strip surrounding quotes if the model added them
+                    suggestion = suggestion.strip('"').strip("'").strip()
+                    return suggestion if suggestion else None
+        return None
 
     def _deterministic_answer(
         self,
@@ -367,22 +436,22 @@ class ChatbotService:
         """Builds grounded non-LLM fallback answer from top cards."""
         top = cards[0]
         lines: list[str] = [
-            f"Top grounded match: {top.question_id} - {top.question_text}.",
-            f"Survey: {top.survey_name} | Wave: {top.wave_year}.",
+            f"**Answer:** {top.question_id} — {top.question_text}",
+            f"Survey: {top.survey_name} | Wave: {top.wave_year}",
         ]
 
         if len(cards) > 1:
-            lines.append("Other relevant grounded matches:")
+            lines.append("\n**Key Details:**")
             for item in cards[1:4]:
-                lines.append(f"- {item.question_id} - {item.question_text}")
+                lines.append(f"- {item.question_id} — {item.question_text}")
 
         if llm_provider.lower() not in {"chatgpt", "openai"}:
-            lines.append(f"{llm_provider.title()} is not implemented yet; using deterministic summary.")
+            lines.append(f"\n_{llm_provider.title()} is not yet supported; showing deterministic results._")
 
         if "allowable" in query.lower() or "options" in query.lower():
             formatted_values = self._format_value_labels(top.value_labels)
             if formatted_values:
-                lines.append("Allowed values for the top match:")
+                lines.append("\n**Allowed Values:**")
                 lines.extend([f"- {value}" for value in formatted_values])
 
         return "\n".join(lines)
@@ -416,13 +485,17 @@ class ChatbotService:
         cards: list[QuestionRecord],
         retrieval_mode: str,
         llm_model: str | None,
-        conversation_context: list[dict[str, str]],
+        conversation_context: list[dict[str, str]],  # kept for signature compatibility
     ) -> str:
-        """Creates deterministic key for answer-level cache."""
+        """Creates deterministic key for answer-level cache.
+
+        Conversation context is intentionally excluded: answers are grounded
+        in retrieved records, not conversation history, so the same records +
+        query + model should return the same cached answer regardless of prior
+        turns.  Including context_fp caused a 100% cache-miss rate.
+        """
         top_ids = [item.question_id for item in cards[:8]]
         top_ids_fingerprint = hashlib.sha256("|".join(top_ids).encode("utf-8")).hexdigest()
-        compact_context = self._conversation_context_block(conversation_context)
-        context_fingerprint = hashlib.sha256(compact_context.encode("utf-8")).hexdigest() if compact_context else ""
         payload = {
             "q": _normalize_query(query),
             "filters": {
@@ -434,7 +507,6 @@ class ChatbotService:
             "top_ids_fp": top_ids_fingerprint,
             "retrieval_mode": retrieval_mode,
             "llm_model": llm_model or "",
-            "context_fp": context_fingerprint,
         }
         raw = json.dumps(payload, sort_keys=True)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -557,7 +629,7 @@ class ChatbotService:
         records_with_values = [record for record in ranked_results if record.value_labels]
         if not records_with_values:
             first = ranked_results[0]
-            answer = (
+            answer = _sanitize_answer(
                 f"I found {first.question_id}, but it does not have coded dropdown/allowed values in the dictionary. "
                 "Try asking for a question that has response options."
             )
@@ -574,8 +646,8 @@ class ChatbotService:
         if len(records_with_values) == 1:
             record = records_with_values[0]
             formatted_values = "\n".join(f"- {item}" for item in self._format_value_labels(record.value_labels))
-            answer = (
-                f"Absolutely. For **{record.question_id}** ({record.question_text}), the allowable response options are:\n"
+            answer = _sanitize_answer(
+                f"For **{record.question_id}** ({record.question_text}), the allowable response options are:\n"
                 f"{formatted_values}"
             )
             return ChatResponse(
@@ -596,11 +668,11 @@ class ChatbotService:
             )
 
         survey_note = f" in **{resolved_survey}**" if resolved_survey else ""
-        answer = (
+        answer = _sanitize_answer(
             f"I found multiple Question {question_ref[1:] if question_ref else ''} variants{survey_note}. "
             "Here are the allowable options for each:\n"
             + "\n".join(sections)
-            + "\n\nIf you want, ask for one specifically (for example, `q5a` or `q5b`) and I’ll give a focused answer."
+            + "\n\nAsk for one specifically (for example, `q5a` or `q5b`) to get a focused answer."
         )
         return ChatResponse(
             answer=answer,
@@ -776,12 +848,12 @@ class ChatbotService:
         question_label = f"{survey_name} question {variant_key}"
         if merged_values:
             values_text = "\n".join(f"- {item}" for item in merged_values)
-            answer = (
+            raw = (
                 f"For **{question_label}** ({primary.question_text}), the allowable response options are:\n"
                 f"{values_text}"
             )
         else:
-            answer = (
+            raw = (
                 f"I found **{question_label}** ({primary.question_text}), but there are no coded dropdown/allowed values "
                 "for this variant in the current dictionary."
             )
@@ -789,7 +861,8 @@ class ChatbotService:
         matched_ids = sorted({record.question_id for record in records})
         if len(matched_ids) > 1:
             ids_text = ", ".join(f"`{question_id}`" for question_id in matched_ids)
-            answer += f"\n\nMatched variable IDs: {ids_text}"
+            raw += f"\n\nMatched variable IDs: {ids_text}"
+        answer = _sanitize_answer(raw)
 
         ranked_results = sorted(candidate_pool, key=self._record_sort_key)[: CHAT_RULES.max_cards_display]
         return ChatResponse(
@@ -967,6 +1040,53 @@ class ChatbotService:
                 code = code[:-2]
             out.append(f"{code}: {label}")
         return out
+
+
+def _sanitize_answer(text: str) -> str:
+    """Cleans answer text before it is stored or shown to users.
+
+    Removes or normalises common artefacts that appear in raw LLM output or
+    templated deterministic strings:
+
+    * Strips leading/trailing whitespace.
+    * Collapses runs of 3+ blank lines to a maximum of 2 (one blank line
+      separating paragraphs is fine; more creates excessive padding in the UI).
+    * Removes stray literal ``\\n`` sequences that survive JSON round-trips or
+      string concatenation errors (e.g. a line that reads ``"text \\n more"``).
+    * Normalises Windows-style ``\\r\\n`` line endings to ``\\n``.
+    * Strips trailing whitespace from every line.
+
+    Parameters
+    ----------
+    text:
+        Raw answer string from LLM synthesis or a deterministic builder.
+
+    Returns
+    -------
+    str
+        Cleaned answer string safe for Markdown rendering.
+    """
+    if not text:
+        return text
+    # Normalise CRLF → LF
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Remove literal backslash-n escape sequences that sometimes leak through
+    # JSON serialisation or string interpolation bugs (e.g. "text \\n more").
+    text = re.sub(r"(?<!\\)\\n", "\n", text)
+    # Strip trailing whitespace from each line
+    lines = [line.rstrip() for line in text.split("\n")]
+    # Collapse 3+ consecutive blank lines → 2
+    cleaned: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if line == "":
+            blank_run += 1
+            if blank_run <= 2:
+                cleaned.append(line)
+        else:
+            blank_run = 0
+            cleaned.append(line)
+    return "\n".join(cleaned).strip()
 
 
 def _normalize_query(query: str) -> str:

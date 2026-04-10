@@ -1,0 +1,47 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "FastAPI (uvicorn dev)",
+      "runtimeExecutable": "/opt/homebrew/bin/python3",
+      "runtimeArgs": [
+        "-m", "uvicorn",
+        "backend.api.app:app",
+        "--host", "127.0.0.1",
+        "--port", "8000",
+        "--reload"
+      ],
+      "env": {
+        "PYTHONPATH": "src"
+      },
+      "port": 8000
+    },
+    {
+      "name": "FastAPI (gunicorn production)",
+      "runtimeExecutable": "/opt/homebrew/bin/python3",
+      "runtimeArgs": [
+        "-m", "gunicorn",
+        "-c", "src/backend/api/gunicorn_conf.py",
+        "backend.api.app:app"
+      ],
+      "env": {
+        "PYTHONPATH": "src"
+      },
+      "port": 8000
+    },
+    {
+      "name": "Streamlit UI",
+      "runtimeExecutable": "/opt/homebrew/bin/python3",
+      "runtimeArgs": [
+        "-m", "streamlit", "run", "src/ui/app.py",
+        "--server.port", "8501",
+        "--server.address", "127.0.0.1"
+      ],
+      "env": {
+        "PYTHONPATH": "src",
+        "API_BASE_URL": "http://127.0.0.1:8000"
+      },
+      "port": 8501
+    }
+  ]
+}

@@ -62,3 +62,4 @@ class ChatResponse:
     confidence_score: float | None = None
     embedding_cache_hit: bool = False
     answer_cache_hit: bool = False
+    follow_up_suggestion: str | None = None

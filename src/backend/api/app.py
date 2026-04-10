@@ -239,6 +239,7 @@ def post_agent_router(request: AgentRouterRequest, raw_request: Request) -> Agen
         needs_clarification=output.needs_clarification,
         unanswered_reason=output.unanswered_reason,
         fallback_reason=output.fallback_reason,
+        follow_up_suggestion=output.follow_up_suggestion,
     )
 
 

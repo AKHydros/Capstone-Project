@@ -117,8 +117,17 @@ def _request_cache_action(*, rebuild: bool, refresh_prompts: bool, toast_message
 
 
 def _ensure_chat_session_enabled(client: ApiClient) -> None:
-    """Best-effort auto-consent call for chat session activation."""
-    if st.session_state.session_consent_applied:
+    """Best-effort auto-consent call for chat session activation.
+
+    Guards against the Streamlit rerender loop: the consent API is called at
+    most once per session_id.  Subsequent rerenders (widget interactions,
+    cache actions) skip the call entirely via the session_consent_applied flag.
+    """
+    if st.session_state.get("session_consent_applied"):
+        return
+    if st.session_state.get("consent_granted"):
+        # Already granted in a prior render — mark applied and skip the API call.
+        st.session_state.session_consent_applied = True
         return
     try:
         client.consent_record(
@@ -166,18 +175,18 @@ def _chat_history_text(history: list[dict[str, object]]) -> str:
     for msg in history:
         role = str(msg.get("role", "unknown")).upper()
         if role == "ASSISTANT" and msg.get("question") and msg.get("answer"):
-            content = f"Question: {str(msg.get('question')).strip()}\\nAnswer: {str(msg.get('answer')).strip()}"
+            content = f"Question: {str(msg.get('question')).strip()}\nAnswer: {str(msg.get('answer')).strip()}"
         else:
             content = str(msg.get("content", "")).strip()
         if not content:
             continue
         lines.append(f"{role}: {content}")
-    return "\\n\\n".join(lines) if lines else "No chat messages yet."
+    return "\n\n".join(lines) if lines else "No chat messages yet."
 
 
 def _format_question_answer_block(question: str, answer: str) -> str:
     """Formats assistant response with explicit Question then Answer sections."""
-    return f"**Question asked**\\n\\n{question}\\n\\n**Answer**\\n\\n{answer}"
+    return f"**Question asked**\n\n{question}\n\n**Answer**\n\n{answer}"
 
 
 def _should_show_sample_cards(question: str, cards: list[dict[str, object]]) -> bool:
@@ -208,6 +217,120 @@ def _render_sample_cards(cards: list[dict[str, object]]) -> None:
                 f"Measurement: {record['measurement_level']}"
             )
             st.caption(f"Topics: {', '.join(record['topic_labels'])}")
+
+
+def _render_sharepoint_panel(uploads_dir: Path) -> None:
+    """Renders the SharePoint connector form inside the sidebar expander.
+
+    Allows admins to pull ``.xlsx`` and ``.docx`` files directly from a
+    SharePoint document library into the local ``user_uploads/`` directory.
+    After a successful sync the admin can trigger a cache rebuild so the
+    newly downloaded files are ingested immediately.
+
+    Configuration is read from environment variables (``SHAREPOINT_*``).
+    Values entered in the form fields override the env vars for the current
+    sync only — they are NOT written back to ``.env``.
+
+    Parameters
+    ----------
+    uploads_dir:
+        Path to ``data/user_uploads/`` where downloaded files are saved.
+    """
+    from backend.loaders.sharepoint_loader import SharePointConfig, SharePointLoader
+
+    st.markdown("##### SharePoint Connector")
+    st.caption(
+        "Connect to a SharePoint document library to pull survey files directly "
+        "into the chatbot. Fill in the fields below or set the corresponding "
+        "``SHAREPOINT_*`` environment variables."
+    )
+
+    # Pre-populate fields from env vars so the form is ready if already configured.
+    default_cfg = SharePointConfig.from_env()
+
+    with st.form("sharepoint_sync_form"):
+        sp_tenant = st.text_input(
+            "Tenant ID",
+            value=default_cfg.tenant_id,
+            placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            help="Azure AD tenant GUID (SHAREPOINT_TENANT_ID).",
+        )
+        sp_client_id = st.text_input(
+            "Client ID",
+            value=default_cfg.client_id,
+            placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            help="Azure AD application (client) ID (SHAREPOINT_CLIENT_ID).",
+        )
+        sp_client_secret = st.text_input(
+            "Client Secret",
+            value=default_cfg.client_secret,
+            type="password",
+            help="Leave blank to use Device Flow authentication (SHAREPOINT_CLIENT_SECRET).",
+        )
+        sp_site_url = st.text_input(
+            "Site URL",
+            value=default_cfg.site_url,
+            placeholder="https://contoso.sharepoint.com/sites/ResearchData",
+            help="Full SharePoint site URL (SHAREPOINT_SITE_URL).",
+        )
+        sp_library_path = st.text_input(
+            "Library Path",
+            value=default_cfg.library_path,
+            placeholder="/sites/ResearchData/Shared Documents/Survey Dictionaries",
+            help="Server-relative path to the document library folder (SHAREPOINT_LIBRARY_PATH).",
+        )
+        auth_mode_options = ["client_credentials", "device_flow"]
+        sp_auth_mode = st.selectbox(
+            "Auth Mode",
+            options=auth_mode_options,
+            index=auth_mode_options.index(default_cfg.auth_mode)
+            if default_cfg.auth_mode in auth_mode_options
+            else 0,
+            help="client_credentials for service accounts; device_flow opens a browser prompt.",
+        )
+        rebuild_after = st.checkbox(
+            "Rebuild index after sync",
+            value=True,
+            help="Automatically rebuild the RAG index so new files are searchable immediately.",
+        )
+        submitted = st.form_submit_button("Sync from SharePoint", use_container_width=True)
+
+    if submitted:
+        override_cfg = SharePointConfig(
+            tenant_id=sp_tenant.strip(),
+            client_id=sp_client_id.strip(),
+            client_secret=sp_client_secret.strip(),
+            site_url=sp_site_url.strip(),
+            library_path=sp_library_path.strip(),
+            auth_mode=sp_auth_mode,
+        )
+        valid, reason = SharePointLoader(config=override_cfg, downloads_dir=uploads_dir).validate_config()
+        if not valid:
+            st.error(f"SharePoint config incomplete: {reason}")
+        else:
+            with st.spinner("Connecting to SharePoint…"):
+                try:
+                    loader = SharePointLoader(config=override_cfg, downloads_dir=uploads_dir)
+                    result = loader.sync()
+                    if result.errors:
+                        for fname, err in result.errors:
+                            st.warning(f"Error downloading {fname}: {err}")
+                    if result.downloaded:
+                        st.success(result.summary)
+                        if rebuild_after:
+                            _request_cache_action(
+                                rebuild=True,
+                                refresh_prompts=True,
+                                toast_message=f"SharePoint sync complete. {len(result.downloaded)} file(s) added. Rebuilding index…",
+                            )
+                    else:
+                        st.info(result.summary)
+                except ImportError as exc:
+                    st.error(str(exc))
+                except RuntimeError as exc:
+                    st.error(f"SharePoint connection failed: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Unexpected error during SharePoint sync: {exc}")
 
 
 def _fallback_reason_text(reason: str | None) -> str:
@@ -520,6 +643,12 @@ with st.sidebar:
                 else:
                     st.toast("No files selected.")
 
+        # ----------------------------------------------------------------
+        # SharePoint connector panel (admin-only)
+        # ----------------------------------------------------------------
+        with st.expander("SharePoint Connector", expanded=False):
+            _render_sharepoint_panel(uploads_dir)
+
     if user_role in {"analyst", "admin"}:
         with st.expander("Utilities", expanded=False):
             st.session_state.llm_provider = st.selectbox(
@@ -701,22 +830,39 @@ else:
         with st.chat_message(str(msg.get("role", "assistant"))):
             role = str(msg.get("role", "assistant"))
             if role == "assistant" and msg.get("question") and msg.get("answer"):
+                # Low-confidence warning for history messages
+                hist_confidence = msg.get("confidence_score")
+                if isinstance(hist_confidence, (int, float)) and hist_confidence < 0.35:
+                    st.warning(
+                        f"Low retrieval confidence ({hist_confidence:.0%}) — results may not be a precise match.",
+                        icon="⚠️",
+                    )
                 st.markdown(_format_question_answer_block(str(msg.get("question")), str(msg.get("answer"))))
+                # Follow-up chip in history
+                hist_follow_up = msg.get("follow_up_suggestion")
+                if hist_follow_up:
+                    st.markdown("---")
+                    st.caption("💡 Suggested follow-up:")
+                    if st.button(hist_follow_up, key=f"hist_followup_{idx}", use_container_width=False):
+                        st.session_state.prefill_prompt = hist_follow_up
+                        st.rerun()
             else:
                 st.markdown(str(msg.get("content", "")))
 
             meta = str(msg.get("meta", "")).strip()
-            if meta:
-                st.caption(meta)
 
             if role == "assistant":
                 confidence_value = msg.get("confidence_score")
-                if isinstance(confidence_value, (int, float)) or confidence_value is None:
+                badge_col, meta_col = st.columns([1, 3])
+                with badge_col:
                     st.caption(confidence_badge(confidence_value if isinstance(confidence_value, (int, float)) else None))
+                with meta_col:
+                    if meta:
+                        st.caption(meta)
 
                 fallback_reason = _fallback_reason_text(str(msg.get("fallback_reason"))) if msg.get("fallback_reason") else ""
                 if fallback_reason:
-                    st.caption(f"Fallback reason: {fallback_reason}")
+                    st.caption(f"Fallback: {fallback_reason}")
 
                 sources = msg.get("sources", []) if isinstance(msg.get("sources", []), list) else []
                 if sources:
@@ -728,7 +874,7 @@ else:
                             if not isinstance(source, dict):
                                 continue
                             st.markdown(
-                                f"{source.get('marker', '')} **{source.get('label', '')}**\\n\\n"
+                                f"{source.get('marker', '')} **{source.get('label', '')}**\n\n"
                                 f"{source.get('question_text', '')}"
                             )
 
@@ -826,10 +972,11 @@ else:
             answer_mode = str(result.get("answer_mode", "direct_answer"))
             needs_clarification = bool(result.get("needs_clarification", False))
             unanswered_reason = result.get("unanswered_reason")
+            follow_up_suggestion = result.get("follow_up_suggestion")
 
             fallback_reason_text = _fallback_reason_text(str(fallback_reason)) if fallback_reason else ""
             meta = (
-                f"route={route_used} | fallback={fallback_used} | latency={latency_ms}ms | "
+                f"route={route_used} | fallback={fallback_used} | latency={latency_ms:.0f}ms | "
                 f"trace_id={trace_id} | mode={answer_mode}"
             )
             if needs_clarification:
@@ -841,14 +988,35 @@ else:
             message_cards = cards if show_sample_cards and isinstance(cards, list) else []
 
             with st.chat_message("assistant"):
+                # Low-confidence notice shown above the answer when retrieval was weak
+                if isinstance(confidence_score, (int, float)) and confidence_score < 0.35:
+                    st.warning(
+                        f"Low retrieval confidence ({confidence_score:.0%}) — results may not be a precise match. "
+                        "Consider broadening your query or adjusting filters.",
+                        icon="⚠️",
+                    )
+
                 st.markdown(_format_question_answer_block(prompt, answer))
-                st.caption(meta)
-                if isinstance(confidence_score, (int, float)):
-                    st.caption(confidence_badge(float(confidence_score)))
-                else:
-                    st.caption(confidence_badge(None))
+
+                # Follow-up suggestion rendered as a clickable prompt chip
+                if follow_up_suggestion:
+                    st.markdown("---")
+                    st.caption("💡 Suggested follow-up:")
+                    if st.button(follow_up_suggestion, key=f"followup_{trace_id}", use_container_width=False):
+                        st.session_state.prefill_prompt = follow_up_suggestion
+                        st.rerun()
+
+                badge_col, meta_col = st.columns([1, 3])
+                with badge_col:
+                    if isinstance(confidence_score, (int, float)):
+                        st.caption(confidence_badge(float(confidence_score)))
+                    else:
+                        st.caption(confidence_badge(None))
+                with meta_col:
+                    st.caption(meta)
+
                 if fallback_reason_text:
-                    st.caption(f"Fallback reason: {fallback_reason_text}")
+                    st.caption(f"Fallback: {fallback_reason_text}")
 
                 if isinstance(sources, list) and sources:
                     marker_text = citation_markers(sources)
@@ -859,7 +1027,7 @@ else:
                             if not isinstance(source, dict):
                                 continue
                             st.markdown(
-                                f"{source.get('marker', '')} **{source.get('label', '')}**\\n\\n"
+                                f"{source.get('marker', '')} **{source.get('label', '')}**\n\n"
                                 f"{source.get('question_text', '')}"
                             )
 
@@ -881,6 +1049,7 @@ else:
                     "unanswered_reason": unanswered_reason,
                     "confidence_score": confidence_score,
                     "fallback_reason": fallback_reason,
+                    "follow_up_suggestion": follow_up_suggestion,
                     "meta": meta,
                 }
             )

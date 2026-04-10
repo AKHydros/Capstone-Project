@@ -74,6 +74,7 @@ class AgentRouterResponse(BaseModel):
     needs_clarification: bool = False
     unanswered_reason: str | None = None
     fallback_reason: str | None = None
+    follow_up_suggestion: str | None = None
 
 
 class ConsentRecordRequest(BaseModel):
