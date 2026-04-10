@@ -16,6 +16,7 @@ src/backend/llm/__init__.py
 src/backend/llm/openai_client.py
 src/backend/loaders/__init__.py
 src/backend/loaders/excel_repository.py
+src/backend/loaders/sharepoint_loader.py
 src/backend/loaders/survey_prompt_loader.py
 src/backend/observability/__init__.py
 src/backend/observability/db.py

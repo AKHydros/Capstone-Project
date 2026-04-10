@@ -94,13 +94,24 @@ Primary users:
 | Evaluation harness | Implemented | Unit coverage under `tests/` including conversational regressions |
 | Unanswered-query analytics | Implemented | `no_cards` / `clarifier_only` tracking + dashboard summary |
 | One-click exports | Implemented | `.txt`, `.json`, `.md` chat export options |
+| Answer cache fix | Implemented | Removed `context_fp` from cache key — enables cache hits on repeated queries |
+| Confidence floor | Implemented | Queries with confidence < 0.25 route to deterministic answer; no noisy LLM synthesis |
+| Structured LLM output | Implemented | System prompt enforces `Answer / Key Details / Suggested Follow-up` headings |
+| Follow-up suggestions | Implemented | LLM response parsed for follow-up chip; rendered as clickable button in UI |
+| Low-confidence warning | Implemented | `⚠️` warning banner shown when retrieval confidence < 0.35 |
+| Domain constraint | Implemented | Out-of-domain queries (weather, sports, general knowledge, etc.) rejected before retrieval |
+| String output hardening | Implemented | `_sanitize_answer()` strips escape artefacts and collapses excess blank lines on all answers |
+| SharePoint connector | Implemented | Admin sidebar panel + `SharePointLoader` backend to pull `.xlsx`/`.docx` from SharePoint |
+| Consent gate debounce | Implemented | Consent API called at most once per session; Streamlit rerender loop eliminated |
+| Log normalization | Implemented | Empty strings coerced to `null` in event logs; confidence always logged |
 
 ---
 
 ## Project Documents
 
 - Current implementation overview: this README.
-- Method-by-method code reference: `docs/METHOD_ANNOTATIONS.md`.
+- Method-by-method code reference: inline docstrings throughout `src/`.
+- SharePoint connector setup: see [SharePoint Setup](#sharepoint-connector-setup) below.
 - Data inputs: `data/market_research_capstone_draft_1.xlsx` plus optional uploads in `data/user_uploads/`.
 - Prompt seed inputs: `.docx` files under `data/` (cached to `data/cache/starter_prompts.json`).
 
@@ -214,23 +225,35 @@ graph TD
 
 Deterministic retrieval filters, consent enforcement, and observability records remain authoritative.
 
+### Domain Constraint
+
+All queries are evaluated by `SafetyService.check_domain()` **before** the retrieval pipeline runs.  Queries that do not contain market-research vocabulary (survey names, variable identifiers, measurement terms, analytical intent words) or that contain explicit out-of-domain patterns (weather, sports, cooking, etc.) are rejected with a polite redirection message logged as `route_used="domain_block"`.
+
+This prevents the LLM from synthesising answers from unrelated context and reduces unnecessary API usage.
+
 ---
 
 ## Core Capabilities
 
 - Hybrid router with explicit modes: `hybrid`, `llm`, `deterministic`
 - Automatic LLM fallback to deterministic mode when health is degraded
+- **Domain constraint check** rejects out-of-scope queries before retrieval runs (`route_used="domain_block"`)
 - Source citations derived from grounded cards and returned with each response
 - Session-only conversation context handoff (bounded turn window)
 - Answer mode metadata (`direct_answer`, `summary`, `allowed_values`, `metadata_lookup`, `clarifier`)
+- **Confidence floor (0.25)** prevents noisy LLM synthesis on weak retrievals; routes to deterministic answer instead
+- **Structured LLM output** (`Answer / Key Details / Suggested Follow-up`) with low-confidence notice injection
+- **Follow-up suggestion** extracted from LLM output and rendered as a clickable chip in the UI
+- **String output hardening** via `_sanitize_answer()` — strips escape artefacts (`\n` literals, CRLF) and collapses excess blank lines
 - Deterministic safety checks with outbound-response validation and basic PII redaction
 - Grounded retrieval over Excel dictionary records (lexical + semantic weighted ranking)
 - Semantic retrieval supports OpenAI embeddings or local TF-IDF fallback
 - Starter prompt extraction from `.docx` survey files with cache signature checks
 - Question-reference hint extraction from `.docx` files for improved variant matching fallback
 - Upload pipeline for additional `.xlsx` and `.docx` assets via UI
+- **SharePoint connector** — pull `.xlsx`/`.docx` files from SharePoint document library with `client_credentials` or `device_flow` auth; admin sidebar panel for configuration
 - EN/FR translation utility with TTL cache
-- Query-result TTL cache in router for repeated requests
+- Query-result TTL cache in router for repeated requests (context-independent answer cache for non-zero hit rates)
 - Feedback capture endpoint and trace-linked persistence (`thumbs +/- note`)
 - Unanswered-query classification (`no_cards`, `clarifier_only`) and analytics endpoint
 - Role-based API authorization via token-to-role mapping (`viewer`, `analyst`, `admin`)
@@ -254,13 +277,24 @@ Deterministic retrieval filters, consent enforcement, and observability records 
 - Bootstrap pipeline for index caching, prompt caching, observability wiring, and question library preload
 - Governance persistence and status updates from UI
 - Deterministic health signal for LLM availability (`Connected`/`Degraded`)
- - Unit test coverage for chatbot routing/lookup behavior and conversational utility helpers
+- Unit test coverage for chatbot routing/lookup behavior and conversational utility helpers
+- RAG answer cache fix (context_fp removed; cache hit rate now non-zero)
+- Confidence floor (0.25) prevents noisy LLM synthesis on weak retrievals
+- Structured LLM output format (`Answer / Key Details / Suggested Follow-up`)
+- Follow-up suggestion parsed and rendered as a clickable chip in the UI
+- Low-confidence `⚠️` warning banner for retrievals below 0.35 confidence
+- Domain constraint check rejects out-of-scope queries before retrieval
+- `_sanitize_answer()` hardens all answer strings (escape artefacts, blank-line collapse)
+- SharePoint connector (`src/backend/loaders/sharepoint_loader.py`) with admin sidebar panel
+- Consent gate Streamlit rerender loop fixed (at most one API call per session)
+- Event log normalized: empty strings coerced to `null`, confidence always logged
 
 ### In Progress / Next
 
 - Broader language support beyond EN/FR dictionary mapping
 - More complete safety policy coverage and nuanced redaction
 - CI workflow for automated test execution and deployment checks
+- SharePoint delta-sync (ETag / modified-date freshness check)
 
 ---
 
@@ -387,6 +421,65 @@ Then route client traffic through NGINX to spread load and reduce tail latency d
 | `API_MAX_REQUESTS` | `2000` | Worker recycle interval to avoid long-lived memory bloat |
 | `API_MAX_REQUESTS_JITTER` | `250` | Randomized recycle jitter to avoid synchronized restarts |
 | `API_LOG_LEVEL` | `info` | Gunicorn/Uvicorn log level |
+| `SHAREPOINT_TENANT_ID` | empty | Azure AD tenant ID for SharePoint auth |
+| `SHAREPOINT_CLIENT_ID` | empty | Azure AD app (client) ID |
+| `SHAREPOINT_CLIENT_SECRET` | empty | Azure AD app client secret |
+| `SHAREPOINT_SITE_URL` | empty | Full SharePoint site URL (e.g. `https://contoso.sharepoint.com/sites/research`) |
+| `SHAREPOINT_LIBRARY_PATH` | `Shared Documents` | Document library path within the site |
+| `SHAREPOINT_AUTH_MODE` | `client_credentials` | Auth flow — `client_credentials` (daemon) or `device_flow` (interactive) |
+| `SHAREPOINT_FILE_EXTENSIONS` | `.xlsx,.docx` | Comma-separated file extensions to sync |
+
+---
+
+## SharePoint Connector Setup
+
+The SharePoint connector (`src/backend/loaders/sharepoint_loader.py`) pulls research files from a SharePoint document library into `data/user_uploads/` so the retrieval index can be rebuilt against updated data.
+
+### Prerequisites
+
+1. **Register an Azure AD app** in your tenant with Microsoft Graph permissions:
+   - `Sites.Read.All` (application permission) for `client_credentials` mode
+   - `Sites.ReadWrite.All` if you need write access (not required here)
+2. **Grant admin consent** for the application permission in Azure AD.
+3. Install the optional dependency: `pip install msal`.
+
+### Auth modes
+
+| Mode | When to use | How it works |
+|---|---|---|
+| `client_credentials` | Automated / server-side daemon | App authenticates with client secret — no user interaction |
+| `device_flow` | Interactive / first-time setup | Prints a code + URL; user authorises in browser |
+
+### Configuration
+
+Set environment variables in `.env` (or enter them in the admin sidebar at runtime):
+
+```bash
+SHAREPOINT_TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+SHAREPOINT_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+SHAREPOINT_CLIENT_SECRET=your-app-secret
+SHAREPOINT_SITE_URL=https://contoso.sharepoint.com/sites/research
+SHAREPOINT_LIBRARY_PATH=Shared Documents/Market Research
+SHAREPOINT_AUTH_MODE=client_credentials
+SHAREPOINT_FILE_EXTENSIONS=.xlsx,.docx
+```
+
+### UI usage
+
+1. Open the Streamlit app and expand **SharePoint Connector** in the left sidebar.
+2. Fill in the form fields (or leave blank to use env vars).
+3. Click **Sync from SharePoint** — the loader downloads new/changed files and optionally triggers an index rebuild.
+
+### Programmatic usage
+
+```python
+from backend.loaders.sharepoint_loader import SharePointConfig, SharePointLoader
+
+config = SharePointConfig.from_env()
+loader = SharePointLoader(config=config, download_dir=Path("data/user_uploads"))
+result = loader.sync()
+print(result.summary)
+```
 
 ---
 
@@ -417,7 +510,8 @@ Auth and tracing notes:
 
 Router contract highlights:
 - `POST /api/agent-router` accepts optional `conversation_context` (list of `{role, content}` turns).
-- Router responses include `sources`, `answer_mode`, `needs_clarification`, `unanswered_reason`, and `fallback_reason` in addition to existing fields.
+- Router responses include `sources`, `answer_mode`, `needs_clarification`, `unanswered_reason`, `fallback_reason`, and `follow_up_suggestion` in addition to existing fields.
+- `route_used="domain_block"` is returned when a query is rejected by the domain constraint check (before retrieval runs); `unanswered_reason="out_of_domain"` is set in this case.
 
 ---
 
@@ -492,6 +586,7 @@ Tracked metrics include:
 │   │   ├── llm/openai_client.py
 │   │   ├── loaders/
 │   │   │   ├── excel_repository.py
+│   │   │   ├── sharepoint_loader.py
 │   │   │   └── survey_prompt_loader.py
 │   │   ├── observability/
 │   │   │   ├── db.py
