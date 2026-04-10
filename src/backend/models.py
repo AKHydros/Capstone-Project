@@ -63,3 +63,4 @@ class ChatResponse:
     embedding_cache_hit: bool = False
     answer_cache_hit: bool = False
     follow_up_suggestion: str | None = None
+    suggestions: list[str] = field(default_factory=list)

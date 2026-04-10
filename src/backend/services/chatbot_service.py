@@ -115,6 +115,29 @@ class ChatbotService:
             self.answer_cache.set(exact_cache_key, self._serialize_chat_response(quick_response, cache_type="exact_lookup"))
             return quick_response
 
+        if self._is_comparison_intent(query):
+            pair = self._extract_two_surveys(query)
+            if pair:
+                return self._comparison_response(
+                    query=query,
+                    survey_a=pair[0],
+                    survey_b=pair[1],
+                    wave_year=wave_year,
+                    topic_label=topic_label,
+                    topic_source_type=topic_source_type,
+                )
+
+        lineage_response = self._lineage_response(
+            query=query,
+            survey_name=survey_name,
+            wave_year=wave_year,
+            topic_label=topic_label,
+            topic_source_type=topic_source_type,
+        )
+        if lineage_response is not None:
+            self.answer_cache.set(exact_cache_key, self._serialize_chat_response(lineage_response, cache_type="exact_lookup"))
+            return lineage_response
+
         search = self.retriever.search_with_details(
             query=query,
             survey_name=survey_name,
@@ -128,6 +151,7 @@ class ChatbotService:
         embedding_cache_hit = search.diagnostics.embedding_cache_hit
 
         if not cards:
+            suggestions = self._build_did_you_mean(query)
             return ChatResponse(
                 answer=_sanitize_answer(
                     "I could not find grounded matches in the current data dictionary. "
@@ -139,6 +163,7 @@ class ChatbotService:
                 confidence_score=confidence,
                 embedding_cache_hit=embedding_cache_hit,
                 answer_cache_hit=False,
+                suggestions=suggestions,
             )
 
         provider_is_supported = llm_provider.lower() in {"chatgpt", "openai"}
@@ -702,6 +727,229 @@ class ChatbotService:
         )
         return any(keyword in lowered for keyword in keywords)
 
+    def _build_did_you_mean(self, query: str) -> list[str]:
+        """Run a broad (unfiltered) search and return up to 3 question texts as suggestions."""
+        try:
+            broad = self.retriever.search_with_details(query=query)
+            return [
+                item.record.question_text
+                for item in broad.scored_results[:3]
+                if item.record.question_text
+            ]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _is_comparison_intent(self, query: str) -> bool:
+        """Detects cross-survey comparison intent (e.g. 'compare PMG20 vs PMG22')."""
+        lowered = query.lower()
+        return bool(
+            re.search(r"\bvs\.?\b|\bversus\b|\bcompare\b.*\bvs\b|\bcompare\b.*\band\b", lowered)
+        )
+
+    def _extract_two_surveys(self, query: str) -> tuple[str, str] | None:
+        """Returns the first two distinct survey tokens found in a query, or None."""
+        tokens = re.findall(r"\b[A-Za-z]{3}\d{2}_[A-Za-z]{3}\b", query, re.IGNORECASE)
+        unique = list(dict.fromkeys(t.upper() for t in tokens))
+        if len(unique) >= 2:
+            return unique[0], unique[1]
+        return None
+
+    def _comparison_response(
+        self,
+        query: str,
+        survey_a: str,
+        survey_b: str,
+        wave_year: str | None,
+        topic_label: str | None,
+        topic_source_type: str | None,
+    ) -> ChatResponse:
+        """Run two searches and format a side-by-side comparison table."""
+        def _top_text(survey: str) -> str:
+            search = self.retriever.search_with_details(
+                query=query,
+                survey_name=survey,
+                wave_year=wave_year,
+                topic_label=topic_label,
+                topic_source_type=topic_source_type,
+            )
+            results = search.scored_results[:3]
+            if not results:
+                return "_No matching records_"
+            lines = []
+            for item in results:
+                r = item.record
+                lines.append(f"**{r.question_id}** — {r.question_text}")
+                if r.value_labels:
+                    lines.append("  Options: " + " | ".join(r.value_labels[:5]))
+            return "\n".join(lines)
+
+        text_a = _top_text(survey_a)
+        text_b = _top_text(survey_b)
+        answer = _sanitize_answer(
+            f"**Cross-Survey Comparison: {survey_a} vs {survey_b}**\n\n"
+            f"**{survey_a}**\n{text_a}\n\n"
+            f"**{survey_b}**\n{text_b}"
+        )
+        all_records = []
+        for survey in (survey_a, survey_b):
+            s = self.retriever.search_with_details(query=query, survey_name=survey)
+            all_records.extend(r.record for r in s.scored_results[:3])
+        return ChatResponse(
+            answer=answer,
+            ranked_results=all_records,
+            retrieval_mode="deterministic",
+            answer_mode="comparison",
+            confidence_score=None,
+            embedding_cache_hit=False,
+            answer_cache_hit=False,
+        )
+
+    def _is_lineage_intent(self, query: str) -> bool:
+        """Detects lineage/evolution intent for question changes over waves/projects."""
+        lowered = query.lower()
+        keywords = (
+            "lineage",
+            "changed over time",
+            "change over time",
+            "across waves",
+            "across projects",
+            "historical",
+            "evolution",
+            "how has",
+            "over time",
+        )
+        return any(keyword in lowered for keyword in keywords)
+
+    def _lineage_response(
+        self,
+        *,
+        query: str,
+        survey_name: str | None,
+        wave_year: str | None,
+        topic_label: str | None,
+        topic_source_type: str | None,
+    ) -> ChatResponse | None:
+        """Builds deterministic timeline showing question wording/value-label evolution."""
+        if not self._is_lineage_intent(query):
+            return None
+
+        question_ref = self._extract_question_ref(query)
+        if question_ref is None:
+            return ChatResponse(
+                answer=(
+                    "I can show lineage once you specify a question reference "
+                    "(for example, `question 5`, `q5a`, or `PMG19_GAM_q5`)."
+                ),
+                ranked_results=[],
+                lookup_mode="exact_id",
+                variant_count=0,
+                retrieval_mode="deterministic",
+                answer_mode="clarifier",
+                needs_clarification=True,
+            )
+
+        query_survey = self._extract_survey_name(query)
+        resolved_survey = survey_name or query_survey
+        filtered_records = apply_filters(
+            self.retriever.records,
+            survey_name=resolved_survey,
+            wave_year=wave_year,
+            topic_label=topic_label,
+            topic_source_type=topic_source_type,
+        )
+        matches = self._match_question_ref_records(filtered_records, question_ref)
+        if not matches and question_ref and resolved_survey:
+            matches = self._hinted_question_ref_records(
+                survey_name=resolved_survey,
+                question_ref=question_ref,
+                wave_year=wave_year,
+                topic_label=topic_label,
+                topic_source_type=topic_source_type,
+                query=query,
+            )
+        if not matches:
+            return ChatResponse(
+                answer=(
+                    f"I could not find lineage records for **{question_ref}** with the current filters. "
+                    "Try clearing filters or specifying a survey token (for example, `PMG19_GAM`)."
+                ),
+                ranked_results=[],
+                lookup_mode="exact_id",
+                variant_count=0,
+                retrieval_mode="deterministic",
+                answer_mode="lineage",
+                needs_clarification=False,
+            )
+
+        groups: dict[tuple[str, str], list[QuestionRecord]] = {}
+        for record in matches:
+            groups.setdefault((record.survey_name, record.wave_year), []).append(record)
+
+        timeline = sorted(
+            (
+                (survey, wave, self._best_variant_record(group_records), group_records)
+                for (survey, wave), group_records in groups.items()
+            ),
+            key=lambda item: (item[0], self._wave_sort_key(item[1])),
+        )
+        if not timeline:
+            return None
+
+        parsed_ref = self._split_question_ref(question_ref)
+        suffix = parsed_ref[1] if parsed_ref is not None else ""
+        if not suffix:
+            variants = sorted(
+                {
+                    self._question_component(record.question_id) or ""
+                    for record in matches
+                    if self._question_component(record.question_id)
+                },
+                key=self._variant_sort_key,
+            )
+        else:
+            variants = []
+
+        lines: list[str] = [
+            f"Lineage for **{question_ref}** across {len(timeline)} survey-wave point(s):",
+        ]
+        if variants:
+            variant_labels = ", ".join(f"`q{variant}`" for variant in variants[:8])
+            lines.append(f"Included variants: {variant_labels}")
+
+        previous_record: QuestionRecord | None = None
+        for survey, wave, record, _group_records in timeline[:12]:
+            line = f"- {survey} {wave} (`{record.question_id}`): {record.question_text}"
+            changes: list[str] = []
+            if previous_record is not None:
+                if record.question_text.strip().lower() != previous_record.question_text.strip().lower():
+                    changes.append("wording changed")
+                previous_values = set(self._format_value_labels(previous_record.value_labels))
+                current_values = set(self._format_value_labels(record.value_labels))
+                added = sorted(current_values - previous_values)
+                removed = sorted(previous_values - current_values)
+                if added:
+                    changes.append(f"+{len(added)} response option(s)")
+                if removed:
+                    changes.append(f"-{len(removed)} response option(s)")
+            if changes:
+                line += f" ({'; '.join(changes)})"
+            lines.append(line)
+            previous_record = record
+
+        if len(timeline) > 12:
+            lines.append(f"... plus {len(timeline) - 12} more records. Refine filters to narrow lineage view.")
+
+        ranked_results = [item[2] for item in timeline[: CHAT_RULES.max_cards_display]]
+        return ChatResponse(
+            answer="\n".join(lines),
+            ranked_results=ranked_results,
+            lookup_mode="exact_id",
+            variant_count=max(1, len(variants) if variants else 1),
+            retrieval_mode="deterministic",
+            answer_mode="lineage",
+            needs_clarification=False,
+        )
+
     def _extract_survey_name(self, query: str) -> str | None:
         """Extracts survey token like `PMG20_GAM` from free text."""
         id_match = re.search(r"\b([A-Za-z]{3}\d{2}_[A-Za-z]{3})(?=_q{1,2})", query, flags=re.IGNORECASE)
@@ -716,6 +964,14 @@ class ChatbotService:
         if not relaxed_match:
             return None
         return f"{relaxed_match.group(1).upper()}{relaxed_match.group(2)}_{relaxed_match.group(3).upper()}"
+
+    def _wave_sort_key(self, wave_year: str) -> tuple[int, str]:
+        """Sorts wave labels chronologically when numeric year is present."""
+        normalized = wave_year.strip()
+        match = re.search(r"(19|20)\d{2}", normalized)
+        if match:
+            return int(match.group(0)), normalized
+        return 10_000, normalized
 
     def _extract_question_ref(self, query: str) -> str | None:
         """Extracts question reference token (supports `q` and `qq` ID forms)."""

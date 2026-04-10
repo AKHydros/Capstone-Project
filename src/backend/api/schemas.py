@@ -33,6 +33,7 @@ class AgentRouterRequest(BaseModel):
     inference: InferenceSettings = Field(default_factory=InferenceSettings)
     input_method: str = "document"
     conversation_context: list[ConversationTurn] = Field(default_factory=list)
+    applied_context: dict[str, str] = Field(default_factory=dict)
 
 
 class ResultCardResponse(BaseModel):
@@ -75,6 +76,8 @@ class AgentRouterResponse(BaseModel):
     unanswered_reason: str | None = None
     fallback_reason: str | None = None
     follow_up_suggestion: str | None = None
+    applied_context: dict[str, str] | None = None
+    suggestions: list[str] = Field(default_factory=list)
 
 
 class ConsentRecordRequest(BaseModel):
@@ -144,3 +147,40 @@ class UnansweredAnalyticsResponse(BaseModel):
 
 class AuthMeResponse(BaseModel):
     role: str
+
+
+class SaveSearchRequest(BaseModel):
+    session_id: str
+    query: str
+    filters: dict[str, str | None] = Field(default_factory=dict)
+    applied_context: dict[str, str | None] = Field(default_factory=dict)
+    pinned: bool = False
+
+
+class SaveSearchResponse(BaseModel):
+    search_id: int
+    stored: bool
+
+
+class SavedSearchItemResponse(BaseModel):
+    id: int
+    session_id: str
+    user_role: str
+    query_text: str
+    query_norm: str
+    filters: dict[str, str | None]
+    applied_context: dict[str, str | None]
+    similarity_key: str
+    pinned: bool
+    reopen_count: int
+    last_reopened_at: str | None
+    created_at: str
+    updated_at: str
+
+
+class SavedSearchListResponse(BaseModel):
+    items: list[SavedSearchItemResponse]
+
+
+class ReopenSearchResponse(BaseModel):
+    item: SavedSearchItemResponse | None

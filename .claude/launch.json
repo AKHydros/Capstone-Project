@@ -9,15 +9,8 @@
     },
     {
       "name": "FastAPI (gunicorn production)",
-      "runtimeExecutable": "/opt/homebrew/bin/python3",
-      "runtimeArgs": [
-        "-m", "gunicorn",
-        "-c", "src/backend/api/gunicorn_conf.py",
-        "backend.api.app:app"
-      ],
-      "env": {
-        "PYTHONPATH": "src"
-      },
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["/tmp/pmg_start_gunicorn.sh"],
       "port": 8000
     },
     {

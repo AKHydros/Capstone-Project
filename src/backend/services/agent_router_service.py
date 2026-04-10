@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import time
@@ -34,6 +34,7 @@ class AgentRouterInput:
     inference: dict[str, int | float] | None = None
     input_method: str = "document"
     conversation_context: list[dict[str, str]] | None = None
+    applied_context: dict[str, str] | None = None
     user_role: str = "viewer"
 
 
@@ -80,6 +81,8 @@ class AgentRouterOutput:
     unanswered_reason: str | None
     fallback_reason: str | None
     follow_up_suggestion: str | None = None
+    applied_context: dict[str, str] | None = None
+    suggestions: list[str] = field(default_factory=list)
 
 
 class AgentRouterService:
@@ -140,6 +143,7 @@ class AgentRouterService:
                 needs_clarification=False,
                 unanswered_reason="no_cards",
                 fallback_reason=None,
+                applied_context=None,
             )
             self._record_event(
                 request,
@@ -182,6 +186,7 @@ class AgentRouterService:
                 needs_clarification=False,
                 unanswered_reason="no_cards",
                 fallback_reason="safety_fallback",
+                applied_context=None,
             )
             self._record_event(
                 request,
@@ -231,6 +236,7 @@ class AgentRouterService:
                 needs_clarification=False,
                 unanswered_reason="out_of_domain",
                 fallback_reason="domain_constraint",
+                applied_context=None,
             )
             self._record_event(
                 request,
@@ -256,6 +262,7 @@ class AgentRouterService:
             request.llm_model,
             request.inference or {},
             request.conversation_context or [],
+            request.applied_context or {},
         )
         cached_payload = self.query_cache.get(cache_key)
         if cached_payload is not None:
@@ -301,6 +308,16 @@ class AgentRouterService:
                     if cached_payload.get("follow_up_suggestion")
                     else None
                 ),
+                applied_context=(
+                    {
+                        str(k): str(v)
+                        for k, v in dict(cached_payload.get("applied_context", {})).items()
+                        if v is not None
+                    }
+                    if isinstance(cached_payload.get("applied_context"), dict)
+                    else None
+                ),
+                suggestions=list(cached_payload.get("suggestions") or []),
             )
             self.store.record_trace(
                 trace_id=trace_id,
@@ -342,6 +359,20 @@ class AgentRouterService:
         wave_year = filters.get("wave_year")
         topic_label = filters.get("topic_label")
         topic_source_type = filters.get("topic_source_type")
+        filter_context = {
+            key: str(value)
+            for key, value in {
+                "survey_name": survey_name,
+                "wave_year": wave_year,
+                "topic_label": topic_label,
+                "topic_source_type": topic_source_type,
+            }.items()
+            if value is not None and str(value).strip()
+        }
+        applied_context = dict(request.applied_context or {})
+        for key, value in filter_context.items():
+            if key not in applied_context:
+                applied_context[key] = value
 
         response_payload = self.chatbot_service.chat(
             translated_query.text,
@@ -397,6 +428,8 @@ class AgentRouterService:
             unanswered_reason=unanswered_reason or None,
             fallback_reason=fallback_reason or None,
             follow_up_suggestion=response_payload.follow_up_suggestion,
+            applied_context=applied_context or None,
+            suggestions=list(response_payload.suggestions),
         )
 
         self.query_cache.set(
@@ -420,6 +453,8 @@ class AgentRouterService:
                 "unanswered_reason": output.unanswered_reason,
                 "fallback_reason": output.fallback_reason,
                 "follow_up_suggestion": output.follow_up_suggestion,
+                "applied_context": output.applied_context or {},
+                "suggestions": output.suggestions,
             },
         )
 
@@ -507,6 +542,7 @@ class AgentRouterService:
             "unanswered_reason": output.unanswered_reason or None,
             "fallback_reason": output.fallback_reason or None,
             "user_role": request.user_role,
+            "applied_context": output.applied_context or {},
             **payload,
         }
         if include_content:
@@ -550,6 +586,7 @@ class AgentRouterService:
         llm_model: str | None,
         inference: dict[str, int | float],
         conversation_context: list[dict[str, str]],
+        applied_context: dict[str, str],
     ) -> str:
         """Builds deterministic router-response cache key from request dimensions."""
         context_items = [
@@ -568,6 +605,7 @@ class AgentRouterService:
             "model": llm_model or "",
             "i": inference,
             "ctx": context_items,
+            "ac": applied_context,
         }
         raw = json.dumps(payload, sort_keys=True)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()

@@ -23,8 +23,13 @@ from .schemas import (
     FeedbackResponse,
     IndexHealthResponse,
     LlmHealthResponse,
+    ReopenSearchResponse,
     ReindexRequest,
     ReindexResponse,
+    SaveSearchRequest,
+    SaveSearchResponse,
+    SavedSearchItemResponse,
+    SavedSearchListResponse,
     UnansweredAnalyticsResponse,
 )
 
@@ -218,6 +223,7 @@ def post_agent_router(request: AgentRouterRequest, raw_request: Request) -> Agen
             inference=request.inference.model_dump(exclude_none=True),
             input_method=request.input_method,
             conversation_context=[turn.model_dump() for turn in request.conversation_context],
+            applied_context=request.applied_context,
             user_role=str(getattr(raw_request.state, "user_role", "viewer")),
         )
     )
@@ -240,7 +246,68 @@ def post_agent_router(request: AgentRouterRequest, raw_request: Request) -> Agen
         unanswered_reason=output.unanswered_reason,
         fallback_reason=output.fallback_reason,
         follow_up_suggestion=output.follow_up_suggestion,
+        applied_context=output.applied_context,
+        suggestions=output.suggestions,
     )
+
+
+@app.post(
+    "/api/searches",
+    response_model=SaveSearchResponse,
+    dependencies=[Depends(_require_roles("viewer", "analyst", "admin"))],
+)
+def post_saved_search(payload: SaveSearchRequest, raw_request: Request) -> SaveSearchResponse:
+    """Persists a query + filter snapshot for quick reopen."""
+    runtime = _runtime()
+    role = str(getattr(raw_request.state, "user_role", "viewer"))
+    search_id = runtime.observability_store.save_search(
+        session_id=payload.session_id,
+        user_role=role,
+        query_text=payload.query,
+        filters=payload.filters,
+        applied_context=payload.applied_context,
+        pinned=payload.pinned,
+    )
+    return SaveSearchResponse(search_id=search_id, stored=True)
+
+
+@app.get(
+    "/api/searches",
+    response_model=SavedSearchListResponse,
+    dependencies=[Depends(_require_roles("viewer", "analyst", "admin"))],
+)
+def get_saved_searches(
+    raw_request: Request,
+    limit: int = 25,
+    session_id: str | None = None,
+    user_role: str | None = None,
+    pinned_only: bool = False,
+) -> SavedSearchListResponse:
+    """Returns recent saved searches for reopen workflows."""
+    runtime = _runtime()
+    role = str(getattr(raw_request.state, "user_role", "viewer"))
+    effective_user_role = user_role if role == "admin" and user_role else role
+    items = runtime.observability_store.list_saved_searches(
+        limit=limit,
+        session_id=session_id,
+        user_role=effective_user_role,
+        pinned_only=pinned_only,
+    )
+    return SavedSearchListResponse(items=[SavedSearchItemResponse(**item) for item in items])
+
+
+@app.post(
+    "/api/searches/{search_id}/reopen",
+    response_model=ReopenSearchResponse,
+    dependencies=[Depends(_require_roles("viewer", "analyst", "admin"))],
+)
+def post_reopen_search(search_id: int) -> ReopenSearchResponse:
+    """Marks a saved search as reopened and returns the latest payload."""
+    runtime = _runtime()
+    item = runtime.observability_store.reopen_saved_search(search_id=search_id)
+    if item is None:
+        return ReopenSearchResponse(item=None)
+    return ReopenSearchResponse(item=SavedSearchItemResponse(**item))
 
 
 @app.get("/api/index/health", response_model=IndexHealthResponse, dependencies=[Depends(_require_roles("admin"))])

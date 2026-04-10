@@ -146,6 +146,22 @@ class ObservabilityStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS saved_searches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    user_role TEXT NOT NULL,
+                    query_text TEXT NOT NULL,
+                    query_norm TEXT NOT NULL,
+                    filters_json TEXT NOT NULL,
+                    applied_context_json TEXT NOT NULL,
+                    similarity_key TEXT NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    reopen_count INTEGER NOT NULL DEFAULT 0,
+                    last_reopened_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
                 CREATE INDEX IF NOT EXISTS idx_events_trace_id ON events(trace_id);
                 CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
@@ -163,6 +179,10 @@ class ObservabilityStore:
                 CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON response_feedback(created_at);
                 CREATE INDEX IF NOT EXISTS idx_unanswered_reason ON unanswered_queries(reason);
                 CREATE INDEX IF NOT EXISTS idx_unanswered_created_at ON unanswered_queries(created_at);
+                CREATE INDEX IF NOT EXISTS idx_saved_searches_created_at ON saved_searches(created_at);
+                CREATE INDEX IF NOT EXISTS idx_saved_searches_session_id ON saved_searches(session_id);
+                CREATE INDEX IF NOT EXISTS idx_saved_searches_similarity ON saved_searches(similarity_key);
+                CREATE INDEX IF NOT EXISTS idx_saved_searches_pinned ON saved_searches(pinned);
                 """
             )
             conn.commit()
@@ -442,6 +462,124 @@ class ObservabilityStore:
         ]
         return {"counts": counts, "recent": recent, "top_patterns": top_patterns}
 
+    def save_search(
+        self,
+        *,
+        session_id: str,
+        user_role: str,
+        query_text: str,
+        filters: dict[str, str | None] | None,
+        applied_context: dict[str, str | None] | None,
+        pinned: bool = False,
+    ) -> int:
+        """Persists a normalized search entry for reopen/reuse workflows."""
+        now = _now()
+        normalized_query = _normalize_query_text(query_text)
+        normalized_filters = {
+            key: (str(value).strip() if value is not None and str(value).strip() else None)
+            for key, value in (filters or {}).items()
+        }
+        normalized_context = {
+            key: (str(value).strip() if value is not None and str(value).strip() else None)
+            for key, value in (applied_context or {}).items()
+        }
+        similarity_key = _similarity_key(normalized_query)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO saved_searches(
+                    session_id, user_role, query_text, query_norm,
+                    filters_json, applied_context_json, similarity_key,
+                    pinned, reopen_count, last_reopened_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
+                """,
+                (
+                    session_id,
+                    user_role,
+                    query_text.strip(),
+                    normalized_query,
+                    json.dumps(normalized_filters),
+                    json.dumps(normalized_context),
+                    similarity_key,
+                    int(pinned),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def list_saved_searches(
+        self,
+        *,
+        limit: int = 25,
+        session_id: str | None = None,
+        user_role: str | None = None,
+        pinned_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Returns recent saved searches with optional session/role filtering."""
+        where: list[str] = []
+        params: list[Any] = []
+        if session_id:
+            where.append("session_id=?")
+            params.append(session_id)
+        if user_role:
+            where.append("user_role=?")
+            params.append(user_role)
+        if pinned_only:
+            where.append("pinned=1")
+        query = "SELECT * FROM saved_searches"
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY pinned DESC, updated_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._saved_search_row_to_payload(row) for row in rows]
+
+    def reopen_saved_search(self, *, search_id: int) -> dict[str, Any] | None:
+        """Marks a saved search as reopened and returns the updated payload."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM saved_searches WHERE id=?",
+                (search_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            now = _now()
+            conn.execute(
+                """
+                UPDATE saved_searches
+                SET reopen_count=reopen_count+1, last_reopened_at=?, updated_at=?
+                WHERE id=?
+                """,
+                (now, now, search_id),
+            )
+            updated = conn.execute("SELECT * FROM saved_searches WHERE id=?", (search_id,)).fetchone()
+            conn.commit()
+        if updated is None:
+            return None
+        return self._saved_search_row_to_payload(updated)
+
+    def _saved_search_row_to_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+        """Converts raw saved-search row to API-safe payload."""
+        return {
+            "id": int(row["id"]),
+            "session_id": str(row["session_id"]),
+            "user_role": str(row["user_role"]),
+            "query_text": str(row["query_text"]),
+            "query_norm": str(row["query_norm"]),
+            "filters": json.loads(row["filters_json"] or "{}"),
+            "applied_context": json.loads(row["applied_context_json"] or "{}"),
+            "similarity_key": str(row["similarity_key"]),
+            "pinned": bool(row["pinned"]),
+            "reopen_count": int(row["reopen_count"]),
+            "last_reopened_at": str(row["last_reopened_at"]) if row["last_reopened_at"] else None,
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
     def upsert_governance_item(
         self,
         *,
@@ -685,3 +823,16 @@ def _percentile(values: list[float], p: float) -> float:
         return values[-1]
     idx = int(round((len(values) - 1) * p))
     return values[idx]
+
+
+def _normalize_query_text(query_text: str) -> str:
+    """Normalizes query text for lightweight similarity grouping."""
+    return " ".join((query_text or "").strip().lower().split())
+
+
+def _similarity_key(query_norm: str, *, max_tokens: int = 5) -> str:
+    """Builds a short key from first tokens to group similar queries."""
+    tokens = [token for token in query_norm.split(" ") if token]
+    if not tokens:
+        return "empty"
+    return " ".join(tokens[:max_tokens])

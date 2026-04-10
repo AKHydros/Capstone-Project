@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 from functools import lru_cache
 import json
 from pathlib import Path
+import re
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -12,8 +14,10 @@ import streamlit as st
 from backend.api.client import ApiClient
 from backend.config import load_config
 from backend.services.bootstrap_service import BootstrapArtifacts, BootstrapService
-from ui.chat_utils import build_conversation_context, chat_history_markdown, citation_markers, confidence_badge
+from ui.chat_utils import build_conversation_context, chat_history_markdown, citation_markers, confidence_badge, export_chat_xlsx, generate_smart_actions
 from ui.style import apply_pmg_theme
+
+_ET_TZ = ZoneInfo("America/Toronto")
 
 
 @lru_cache(maxsize=1)
@@ -80,6 +84,20 @@ def _init_state() -> None:
         st.session_state.topic_filter = "All"
     if "label_type_filter" not in st.session_state:
         st.session_state.label_type_filter = "All"
+    if "sticky_survey_name" not in st.session_state:
+        st.session_state.sticky_survey_name = None
+    if "sticky_wave_year" not in st.session_state:
+        st.session_state.sticky_wave_year = None
+    if "last_query_text" not in st.session_state:
+        st.session_state.last_query_text = ""
+    if "last_query_filters" not in st.session_state:
+        st.session_state.last_query_filters = {}
+    if "last_applied_context" not in st.session_state:
+        st.session_state.last_applied_context = {}
+    if "batch_lookup_ids" not in st.session_state:
+        st.session_state.batch_lookup_ids = []
+    if "batch_lookup_results" not in st.session_state:
+        st.session_state.batch_lookup_results = None
 
 
 def _save_uploaded_files(uploads_dir: Path, uploaded_files: list[object] | None) -> int:
@@ -95,7 +113,7 @@ def _save_uploaded_files(uploads_dir: Path, uploaded_files: list[object] | None)
 def _cache_status_text(artifacts: BootstrapArtifacts) -> tuple[str, str, str, str]:
     """Formats cache status summary values for UI display."""
     built_at = (
-        datetime.fromtimestamp(artifacts.cache_status.created_at_epoch, tz=timezone.utc).isoformat(timespec="seconds")
+        _format_timestamp_et(datetime.fromtimestamp(artifacts.cache_status.created_at_epoch, tz=timezone.utc))
         if artifacts.cache_status.created_at_epoch
         else "N/A"
     )
@@ -116,17 +134,13 @@ def _request_cache_action(*, rebuild: bool, refresh_prompts: bool, toast_message
     st.rerun()
 
 
-def _ensure_chat_session_enabled(client: ApiClient) -> None:
-    """Best-effort auto-consent call for chat session activation.
-
-    Guards against the Streamlit rerender loop: the consent API is called at
-    most once per session_id.  Subsequent rerenders (widget interactions,
-    cache actions) skip the call entirely via the session_consent_applied flag.
-    """
+def _ensure_chat_session_enabled(client: ApiClient, *, enabled: bool) -> None:
+    """Applies one-time session activation only when top checkbox is enabled."""
+    if not enabled:
+        return
     if st.session_state.get("session_consent_applied"):
         return
     if st.session_state.get("consent_granted"):
-        # Already granted in a prior render — mark applied and skip the API call.
         st.session_state.session_consent_applied = True
         return
     try:
@@ -138,7 +152,151 @@ def _ensure_chat_session_enabled(client: ApiClient) -> None:
         st.session_state.consent_granted = True
         st.session_state.session_consent_applied = True
     except Exception:  # noqa: BLE001
-        st.session_state.pending_toast = "Could not auto-enable chat session consent."
+        st.session_state.pending_toast = "Could not start this chat session yet."
+
+
+def _format_timestamp_et(value: str | datetime | None) -> str:
+    """Formats UTC/ISO timestamps into Eastern time, always labelled 'ET'."""
+    if value is None:
+        return "N/A"
+    parsed: datetime | None = None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return "N/A"
+        if cleaned.endswith("Z"):
+            cleaned = f"{cleaned[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(cleaned)
+        except ValueError:
+            return value
+    if parsed is None:
+        return "N/A"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    localized = parsed.astimezone(_ET_TZ)
+    return localized.strftime("%Y-%m-%d %H:%M ET")
+
+
+def _extract_survey_name(query: str) -> str | None:
+    """Extracts survey token (e.g., PMG19_GAM) from user text."""
+    id_match = re.search(r"\b([A-Za-z]{3}\d{2}_[A-Za-z]{3})\b", query)
+    if id_match:
+        return id_match.group(1).upper()
+    relaxed_match = re.search(r"\b([A-Za-z]{3})[\s_-]?(\d{2})[\s_-]?([A-Za-z]{3})\b", query)
+    if not relaxed_match:
+        return None
+    return f"{relaxed_match.group(1).upper()}{relaxed_match.group(2)}_{relaxed_match.group(3).upper()}"
+
+
+def _extract_question_token(text: str) -> str | None:
+    """Extracts q token from question IDs for smart follow-up prompts."""
+    match = re.search(r"_q{1,2}(\d+(?:\.\d+)?[a-z]?)\b", text, flags=re.IGNORECASE)
+    if match:
+        return f"q{match.group(1).lower()}"
+    match = re.search(r"\bq(?:uestion)?\s*(\d+(?:\.\d+)?[a-z]?)\b", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return f"q{match.group(1).lower()}"
+
+
+def _smart_next_actions(
+    *,
+    question: str,
+    follow_up_suggestion: str | None,
+    sources: list[dict[str, object]],
+    answer_mode: str = "direct_answer",
+    confidence_score: float | None = None,
+) -> list[str]:
+    """Builds compact, clickable next-action prompts from response context.
+
+    Parameters
+    ----------
+    question : str
+        The user's original query text.
+    follow_up_suggestion : str | None
+        Parsed follow-up suggestion from the LLM, if any.
+    sources : list[dict[str, object]]
+        Citation source dicts returned by the router.
+    answer_mode : str
+        The ``answer_mode`` from the router response.  Drives which action
+        categories are surfaced (e.g. ``allowed_values``, ``summary``).
+    confidence_score : float | None
+        Retrieval confidence (0–1).  Scores below 0.35 surface a rephrase hint.
+    """
+    first_source = sources[0] if sources else {}
+    survey = str(first_source.get("survey_name", "")).strip()
+    question_id = str(first_source.get("question_id", "")).strip()
+    q_token = _extract_question_token(question_id or question)
+    actions: list[str] = []
+
+    # LLM-suggested follow-up goes first
+    if follow_up_suggestion:
+        actions.append(follow_up_suggestion.strip())
+
+    # Answer-mode specific suggestions
+    if answer_mode == "allowed_values":
+        actions.append("Compare response scales across waves")
+        actions.append("Show all questions in this section")
+    elif answer_mode == "summary":
+        actions.append("Break down by individual question")
+        actions.append("Compare across years")
+    elif answer_mode == "clarifier":
+        actions.append("Show all variants")
+    else:
+        # direct_answer / metadata_lookup / fallback
+        if survey and q_token:
+            actions.append(f"Compare {survey} {q_token} across years")
+        elif survey:
+            actions.append(f"Compare {survey} across years")
+        if survey:
+            actions.append(f"Filter to survey {survey}")
+        if question_id:
+            actions.append(f"Show broader concepts related to {question_id}")
+            actions.append(f"Show similar wording to {question_id}")
+        else:
+            actions.append("Find broader concepts for this question")
+            actions.append("Show similar wording variants")
+
+    # Low-confidence: suggest rephrasing
+    if isinstance(confidence_score, float) and confidence_score < 0.35:
+        actions.append("Rephrase my question")
+
+    # Lineage chip (always available, skipped if already in lineage mode)
+    if answer_mode != "lineage":
+        if q_token:
+            actions.append(f"View lineage of {q_token} across waves")
+        else:
+            actions.append("View lineage across waves")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for action in actions:
+        normalized = action.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+    return deduped[:6]
+
+
+def _render_next_action_chips(actions: list[str], *, key_prefix: str) -> None:
+    """Renders actionable prompt chips beneath assistant responses."""
+    if not actions:
+        return
+    st.caption("Next actions:")
+    col_a, col_b = st.columns(2)
+    for idx, action in enumerate(actions):
+        col = col_a if idx % 2 == 0 else col_b
+        with col:
+            if st.button(action, key=f"{key_prefix}_{idx}", use_container_width=True):
+                st.session_state.prefill_prompt = action
+                st.rerun()
 
 
 def _combine_starter_prompts(starter_prompts: list[str], top_questions: list[str]) -> list[str]:
@@ -502,7 +660,6 @@ except Exception as exc:  # noqa: BLE001
     st.stop()
 
 client = ApiClient(config=config, artifacts=artifacts)
-_ensure_chat_session_enabled(client)
 
 try:
     me_payload = client.auth_me()
@@ -526,7 +683,9 @@ llm_status = llm_health.get("status", "Unknown")
 deployment_mode = "Remote API" if client.using_remote_api else "In-process API adapter"
 llm_badge = "🟢 Connected" if str(llm_status).lower() == "connected" else "🔴 Disconnected"
 
-header_logo_col, header_menu_col, header_title_col, header_dashboard_col = st.columns([1.1, 1.35, 4.35, 1.2])
+header_logo_col, header_session_col, header_menu_col, header_title_col, header_dashboard_col = st.columns(
+    [1.1, 1.2, 1.35, 3.95, 1.2]
+)
 with header_logo_col:
     logo_path = Path(__file__).parent / "assets" / "pmg_logo.png"
     if logo_path.exists():
@@ -534,9 +693,15 @@ with header_logo_col:
     else:
         st.markdown("### PMG")
 
+with header_session_col:
+    if st.session_state.get("consent_granted"):
+        st.caption("🟢 Session active")
+    else:
+        st.caption("⚪ Session not started")
+
 with header_menu_col:
     with st.popover("Chat & System"):
-        export_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        export_ts = datetime.now(_ET_TZ).strftime("%Y%m%d_%H%M%S")
         st.markdown("#### Chat Export")
         if can_export:
             st.download_button(
@@ -563,13 +728,23 @@ with header_menu_col:
                 use_container_width=True,
                 key="export_chat_md",
             )
+            xlsx_bytes = export_chat_xlsx(st.session_state.chat_history)
+            if xlsx_bytes:
+                st.download_button(
+                    "Export Chat (.xlsx)",
+                    data=xlsx_bytes,
+                    file_name=f"chat_export_{export_ts}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="export_chat_xlsx",
+                )
         else:
             st.caption("Export is available for analyst/admin roles.")
 
         st.markdown("#### LLM Health")
         st.write(llm_badge)
         if llm_health.get("last_check_time"):
-            st.caption(f"Checked: {llm_health.get('last_check_time')}")
+            st.caption(f"Checked: {_format_timestamp_et(str(llm_health.get('last_check_time')))}")
 
         st.markdown("#### Client Mode")
         st.write(f"**{deployment_mode}**")
@@ -643,12 +818,6 @@ with st.sidebar:
                 else:
                     st.toast("No files selected.")
 
-        # ----------------------------------------------------------------
-        # SharePoint connector panel (admin-only)
-        # ----------------------------------------------------------------
-        with st.expander("SharePoint Connector", expanded=False):
-            _render_sharepoint_panel(uploads_dir)
-
     if user_role in {"analyst", "admin"}:
         with st.expander("Utilities", expanded=False):
             st.session_state.llm_provider = st.selectbox(
@@ -719,14 +888,21 @@ with st.sidebar:
                 st.caption("Active max output tokens: model default")
 
         with st.expander("Input Method", expanded=False):
-            st.session_state.input_method = "Document"
-            st.selectbox(
+            input_options = ["Document", "SharePoint"] if is_admin else ["Document"]
+            if st.session_state.input_method not in input_options:
+                st.session_state.input_method = "Document"
+            st.session_state.input_method = st.selectbox(
                 "Choose Input Method",
-                options=["Document"],
-                index=0,
-                disabled=True,
+                options=input_options,
+                index=input_options.index(st.session_state.input_method),
             )
-            st.caption("Webpage/Audio/Image/PPT modes are deprecated until dedicated ingestion pipelines are implemented.")
+            if st.session_state.input_method == "SharePoint":
+                if is_admin:
+                    _render_sharepoint_panel(uploads_dir)
+                else:
+                    st.caption("SharePoint sync is available for admin role.")
+            else:
+                st.caption("Document mode uses indexed survey dictionaries and uploaded files.")
 
         with st.expander("Translation Method", expanded=False):
             language_options = ["en", "fr"]
@@ -800,6 +976,154 @@ with st.sidebar:
                     toast_message="Starter prompts refresh requested.",
                 )
 
+    with st.expander("Recent Searches", expanded=False):
+        if st.session_state.last_query_text:
+            if st.button("Save Current Query", use_container_width=True, key="save_current_query_btn"):
+                save_result = client.save_search(
+                    session_id=st.session_state.session_id,
+                    query=str(st.session_state.last_query_text),
+                    filters=dict(st.session_state.last_query_filters),
+                    applied_context=dict(st.session_state.last_applied_context),
+                    pinned=True,
+                )
+                if save_result.get("stored"):
+                    st.toast("Current query saved.")
+                    st.rerun()
+
+        searches_payload = client.list_searches(limit=20)
+        search_items = searches_payload.get("items", [])
+        # Pinned searches float to top
+        pinned_items = [i for i in search_items if isinstance(i, dict) and i.get("pinned")]
+        recent_items = [i for i in search_items if isinstance(i, dict) and not i.get("pinned")]
+        search_items = pinned_items + recent_items
+        if not search_items:
+            st.caption("No searches yet — queries are saved automatically.")
+        for item in search_items:
+            if not isinstance(item, dict):
+                continue
+            search_id = int(item.get("id", 0))
+            if search_id <= 0:
+                continue
+            query_text = str(item.get("query_text", "")).strip()
+            preview = query_text if len(query_text) <= 60 else f"{query_text[:57]}..."
+            pinned_label = "📌 " if bool(item.get("pinned")) else ""
+            created_at = _format_timestamp_et(str(item.get("created_at", ""))) if item.get("created_at") else ""
+            reopen_count = int(item.get("reopen_count", 0))
+            survey_ctx = ""
+            applied = item.get("applied_context") or {}
+            if isinstance(applied, dict) and applied.get("survey_name"):
+                survey_ctx = f" · {applied['survey_name']}"
+            st.markdown(f"**{pinned_label}{preview}**")
+            meta_parts = []
+            if created_at:
+                meta_parts.append(created_at)
+            if survey_ctx:
+                meta_parts.append(survey_ctx.strip(" ·"))
+            if reopen_count:
+                meta_parts.append(f"reopened {reopen_count}×")
+            if meta_parts:
+                st.caption(" | ".join(meta_parts))
+            open_col, pin_col = st.columns(2)
+            with open_col:
+                if st.button("↩ Reopen", key=f"reopen_search_{search_id}", use_container_width=True):
+                    reopen_result = client.reopen_search(search_id=search_id)
+                    reopened_item = reopen_result.get("item") or item
+                    st.session_state.prefill_prompt = str(reopened_item.get("query_text", "")).strip()
+                    reopened_filters = reopened_item.get("filters", {}) if isinstance(reopened_item, dict) else {}
+                    st.session_state.survey_filter = str(reopened_filters.get("survey_name") or "All")
+                    st.session_state.wave_filter = str(reopened_filters.get("wave_year") or "All")
+                    st.session_state.topic_filter = str(reopened_filters.get("topic_label") or "All")
+                    st.session_state.label_type_filter = str(reopened_filters.get("topic_source_type") or "All")
+                    st.toast("Search reopened.")
+                    st.rerun()
+            with pin_col:
+                if not bool(item.get("pinned")):
+                    if st.button("📌 Pin", key=f"pin_search_{search_id}", use_container_width=True):
+                        client.save_search(
+                            session_id=str(item.get("session_id", st.session_state.session_id)),
+                            query=query_text,
+                            filters=item.get("filters", {}) if isinstance(item.get("filters", {}), dict) else {},
+                            applied_context=item.get("applied_context", {})
+                            if isinstance(item.get("applied_context", {}), dict)
+                            else {},
+                            pinned=True,
+                        )
+                        st.toast("Search pinned.")
+                        st.rerun()
+
+    # --- Survey Coverage Navigator ---
+    with st.expander("Browse Topics", expanded=False):
+        nav_topic = st.selectbox(
+            "Select a topic",
+            options=["— choose —"] + topic_options[1:],
+            key="nav_topic_select",
+        )
+        if nav_topic and nav_topic != "— choose —":
+            st.caption(f"Questions tagged **{nav_topic}**:")
+            all_records_nav = getattr(artifacts, "chatbot_service", None)
+            records_nav = (
+                list(all_records_nav.retriever.records) if all_records_nav and hasattr(all_records_nav, "retriever") else []
+            )
+            hits = [
+                r for r in records_nav
+                if nav_topic.lower() in [t.lower() for t in r.topic_labels]
+            ][:20]
+            if hits:
+                for r in hits:
+                    if st.button(
+                        f"{r.question_id} — {r.question_text[:60]}",
+                        key=f"nav_q_{r.question_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.prefill_prompt = f"Tell me about {r.question_id}"
+                        st.rerun()
+            else:
+                st.caption("No questions found for this topic.")
+
+    # --- Batch Variable Lookup ---
+    with st.expander("Batch Lookup", expanded=False):
+        st.caption("Paste question IDs (one per line) to look up multiple variables at once.")
+        batch_input = st.text_area("Question IDs", key="batch_lookup_input", height=100)
+        if st.button("Run Batch Lookup", use_container_width=True, key="batch_lookup_btn"):
+            ids = [line.strip() for line in batch_input.splitlines() if line.strip()]
+            if ids:
+                st.session_state.batch_lookup_ids = ids
+                st.session_state.batch_lookup_results = None
+                st.rerun()
+            else:
+                st.toast("Enter at least one question ID.")
+
+# --- Batch Lookup Results Panel ---
+if st.session_state.batch_lookup_ids and not st.session_state.show_admin_dashboard:
+    with st.expander(f"Batch Lookup — {len(st.session_state.batch_lookup_ids)} ID(s)", expanded=True):
+        rows = []
+        for qid in st.session_state.batch_lookup_ids:
+            result = client.agent_router(
+                session_id=st.session_state.session_id,
+                query=qid,
+                language=st.session_state.language,
+                filters={},
+                mode="deterministic",
+                llm_provider=st.session_state.llm_provider,
+                llm_model=st.session_state.llm_model,
+                inference={},
+                input_method="document",
+                conversation_context=[],
+                applied_context={},
+            )
+            rows.append({
+                "ID": qid,
+                "Answer": str(result.get("response", ""))[:200],
+                "Confidence": f"{float(result['confidence_score']):.0%}" if result.get("confidence_score") is not None else "N/A",
+                "Mode": str(result.get("answer_mode", "")),
+            })
+        import pandas as _pd
+        st.dataframe(_pd.DataFrame(rows), use_container_width=True)
+        if st.button("Clear batch results", key="clear_batch"):
+            st.session_state.batch_lookup_ids = []
+            st.session_state.batch_lookup_results = None
+            st.rerun()
+
 if st.session_state.show_admin_dashboard and can_dashboard:
     _render_admin_dashboard(client, user_role)
 else:
@@ -826,10 +1150,30 @@ else:
         if not filtered_prompts:
             st.info("No prompts match your search.")
 
+    if not st.session_state.get("consent_granted"):
+        with st.container(border=True):
+            st.info(
+                "**Welcome to PMG Intelligence** \n\n"
+                "Tick the box below to activate your session and start asking questions "
+                "about the research data dictionary."
+            )
+            agreed = st.checkbox(
+                "I understand this session will be logged for quality and governance purposes.",
+                key="consent_checkbox",
+            )
+            if agreed:
+                _ensure_chat_session_enabled(client, enabled=True)
+                st.rerun()
+
     for idx, msg in enumerate(st.session_state.chat_history):
         with st.chat_message(str(msg.get("role", "assistant"))):
             role = str(msg.get("role", "assistant"))
             if role == "assistant" and msg.get("question") and msg.get("answer"):
+                hist_mode = str(msg.get("answer_mode", ""))
+                if hist_mode == "lineage":
+                    st.caption("🔍 **Lineage View** — showing how this question changed across waves")
+                elif hist_mode == "comparison":
+                    st.caption("⚖️ **Cross-Survey Comparison**")
                 # Low-confidence warning for history messages
                 hist_confidence = msg.get("confidence_score")
                 if isinstance(hist_confidence, (int, float)) and hist_confidence < 0.35:
@@ -838,14 +1182,12 @@ else:
                         icon="⚠️",
                     )
                 st.markdown(_format_question_answer_block(str(msg.get("question")), str(msg.get("answer"))))
-                # Follow-up chip in history
-                hist_follow_up = msg.get("follow_up_suggestion")
-                if hist_follow_up:
+                history_actions = msg.get("next_actions")
+                if isinstance(history_actions, list) and history_actions:
                     st.markdown("---")
-                    st.caption("💡 Suggested follow-up:")
-                    if st.button(hist_follow_up, key=f"hist_followup_{idx}", use_container_width=False):
-                        st.session_state.prefill_prompt = hist_follow_up
-                        st.rerun()
+                    _render_next_action_chips([str(action) for action in history_actions], key_prefix=f"hist_action_{idx}")
+                if msg.get("annotation"):
+                    st.caption(f"📝 Note: {msg['annotation']}")
             else:
                 st.markdown(str(msg.get("content", "")))
 
@@ -918,8 +1260,26 @@ else:
                     st.markdown("#### Sample Answer Cards")
                     _render_sample_cards(cards)
 
-    prompt = st.chat_input("Ask about variables, labels, mappings, and trends")
-    if not prompt and st.session_state.prefill_prompt:
+    chat_disabled = not st.session_state.get("consent_granted", False)
+    prompt = st.chat_input("Ask about variables, labels, mappings, and trends", disabled=chat_disabled)
+    if chat_disabled:
+        st.caption("Tick the consent box above to begin chatting.")
+
+    # Active survey context pill — shows which survey follow-up queries will target
+    if st.session_state.get("sticky_survey_name") and not chat_disabled:
+        ctx_label = f"📌 Active context: **{st.session_state.sticky_survey_name}**"
+        if st.session_state.get("sticky_wave_year"):
+            ctx_label += f" · {st.session_state.sticky_wave_year}"
+        ctx_col, clear_col = st.columns([9, 1])
+        with ctx_col:
+            st.caption(ctx_label)
+        with clear_col:
+            if st.button("✕", key="clear_sticky_context", help="Clear active survey context"):
+                st.session_state.sticky_survey_name = None
+                st.session_state.sticky_wave_year = None
+                st.session_state.last_applied_context = {}
+                st.rerun()
+    if not prompt and st.session_state.prefill_prompt and not chat_disabled:
         prompt = st.session_state.prefill_prompt
         st.session_state.prefill_prompt = ""
 
@@ -936,6 +1296,28 @@ else:
             "topic_label": None if topic_filter == "All" else topic_filter,
             "topic_source_type": None if label_type_filter == "All" else label_type_filter,
         }
+        applied_context: dict[str, str] = {}
+        explicit_survey = _extract_survey_name(prompt)
+        if filters["survey_name"]:
+            applied_context["survey_name"] = str(filters["survey_name"])
+            applied_context["survey_source"] = "sidebar"
+        elif explicit_survey:
+            filters["survey_name"] = explicit_survey
+            applied_context["survey_name"] = explicit_survey
+            applied_context["survey_source"] = "query"
+        elif st.session_state.sticky_survey_name:
+            filters["survey_name"] = str(st.session_state.sticky_survey_name)
+            applied_context["survey_name"] = str(st.session_state.sticky_survey_name)
+            applied_context["survey_source"] = "sticky"
+            if not filters["wave_year"] and st.session_state.sticky_wave_year:
+                filters["wave_year"] = str(st.session_state.sticky_wave_year)
+        if filters["wave_year"]:
+            applied_context["wave_year"] = str(filters["wave_year"])
+        if filters["topic_label"]:
+            applied_context["topic_label"] = str(filters["topic_label"])
+        if filters["topic_source_type"]:
+            applied_context["topic_source_type"] = str(filters["topic_source_type"])
+
         inference_settings: dict[str, int | float] = {}
         if st.session_state.inference_max_length_enabled:
             inference_settings["max_length"] = int(st.session_state.inference_max_length)
@@ -943,6 +1325,9 @@ else:
             inference_settings["top_p"] = float(st.session_state.inference_top_p)
         if st.session_state.inference_temperature_enabled:
             inference_settings["temperature"] = float(st.session_state.inference_temperature)
+        st.session_state.last_query_text = prompt
+        st.session_state.last_query_filters = dict(filters)
+        st.session_state.last_applied_context = dict(applied_context)
 
         try:
             result = client.agent_router(
@@ -956,6 +1341,7 @@ else:
                 inference=inference_settings,
                 input_method=st.session_state.input_method.lower(),
                 conversation_context=conversation_context,
+                applied_context=applied_context,
             )
         except Exception as exc:  # noqa: BLE001
             st.error(f"Agent router failed: {exc}")
@@ -973,6 +1359,14 @@ else:
             needs_clarification = bool(result.get("needs_clarification", False))
             unanswered_reason = result.get("unanswered_reason")
             follow_up_suggestion = result.get("follow_up_suggestion")
+            suggestions = result.get("suggestions") or []
+            result_applied_context = (
+                result.get("applied_context", {})
+                if isinstance(result.get("applied_context", {}), dict)
+                else {}
+            )
+            if result_applied_context:
+                st.session_state.last_applied_context = dict(result_applied_context)
 
             fallback_reason_text = _fallback_reason_text(str(fallback_reason)) if fallback_reason else ""
             meta = (
@@ -983,11 +1377,36 @@ else:
                 meta += " | clarification_required=true"
             if unanswered_reason:
                 meta += f" | unanswered={unanswered_reason}"
+            if result_applied_context.get("survey_name"):
+                meta += f" | survey={result_applied_context.get('survey_name')}"
+            if result_applied_context.get("survey_source"):
+                meta += f" | context={result_applied_context.get('survey_source')}"
 
             show_sample_cards = _should_show_sample_cards(prompt, cards)
             message_cards = cards if show_sample_cards and isinstance(cards, list) else []
+            source_list = sources if isinstance(sources, list) else []
+            if source_list:
+                top_source = source_list[0] if isinstance(source_list[0], dict) else {}
+                source_survey = str(top_source.get("survey_name", "")).strip()
+                source_wave = str(top_source.get("wave_year", "")).strip()
+                if source_survey:
+                    st.session_state.sticky_survey_name = source_survey
+                if source_wave:
+                    st.session_state.sticky_wave_year = source_wave
+            next_actions = _smart_next_actions(
+                question=prompt,
+                follow_up_suggestion=str(follow_up_suggestion) if follow_up_suggestion else None,
+                sources=source_list if isinstance(source_list, list) else [],
+                answer_mode=str(answer_mode) if answer_mode else "direct_answer",
+                confidence_score=float(confidence_score) if isinstance(confidence_score, (int, float)) else None,
+            )
 
             with st.chat_message("assistant"):
+                if answer_mode == "lineage":
+                    st.caption("🔍 **Lineage View** — showing how this question changed across waves")
+                elif answer_mode == "comparison":
+                    st.caption("⚖️ **Cross-Survey Comparison**")
+
                 # Low-confidence notice shown above the answer when retrieval was weak
                 if isinstance(confidence_score, (int, float)) and confidence_score < 0.35:
                     st.warning(
@@ -998,13 +1417,9 @@ else:
 
                 st.markdown(_format_question_answer_block(prompt, answer))
 
-                # Follow-up suggestion rendered as a clickable prompt chip
-                if follow_up_suggestion:
+                if next_actions:
                     st.markdown("---")
-                    st.caption("💡 Suggested follow-up:")
-                    if st.button(follow_up_suggestion, key=f"followup_{trace_id}", use_container_width=False):
-                        st.session_state.prefill_prompt = follow_up_suggestion
-                        st.rerun()
+                    _render_next_action_chips(next_actions, key_prefix=f"next_action_{trace_id}")
 
                 badge_col, meta_col = st.columns([1, 3])
                 with badge_col:
@@ -1018,12 +1433,12 @@ else:
                 if fallback_reason_text:
                     st.caption(f"Fallback: {fallback_reason_text}")
 
-                if isinstance(sources, list) and sources:
-                    marker_text = citation_markers(sources)
+                if isinstance(source_list, list) and source_list:
+                    marker_text = citation_markers(source_list)
                     if marker_text:
                         st.caption(f"Citations: {marker_text}")
                     with st.expander("Sources", expanded=False):
-                        for source in sources:
+                        for source in source_list:
                             if not isinstance(source, dict):
                                 continue
                             st.markdown(
@@ -1035,6 +1450,49 @@ else:
                     st.markdown("#### Sample Answer Cards")
                     _render_sample_cards(message_cards)
 
+                # Did you mean? — shown when no grounded results
+                if suggestions:
+                    st.markdown("**Did you mean?**")
+                    sug_cols = st.columns(min(len(suggestions), 3))
+                    for si, sug in enumerate(suggestions[:3]):
+                        with sug_cols[si]:
+                            if st.button(sug[:70], key=f"sug_{trace_id}_{si}", use_container_width=True):
+                                st.session_state.prefill_prompt = sug
+                                st.rerun()
+
+                # Variable relationship map — questions sharing topic labels
+                src_topics: list[str] = []
+                for src in source_list:
+                    if isinstance(src, dict):
+                        for t in (src.get("topic_labels") or []):
+                            if t and t not in src_topics:
+                                src_topics.append(t)
+                if src_topics:
+                    rel_records = [
+                        r for r in getattr(artifacts.chatbot_service, "retriever", None).records
+                        if any(t in r.topic_labels for t in src_topics[:2])
+                        and r.question_id not in {s.get("question_id") for s in source_list if isinstance(s, dict)}
+                    ][:4] if getattr(artifacts, "chatbot_service", None) else []
+                    if rel_records:
+                        with st.expander("🔗 Related questions", expanded=False):
+                            for rel in rel_records:
+                                if st.button(
+                                    f"{rel.question_id} — {rel.question_text[:60]}",
+                                    key=f"rel_{trace_id}_{rel.question_id}",
+                                    use_container_width=True,
+                                ):
+                                    st.session_state.prefill_prompt = f"Tell me about {rel.question_id}"
+                                    st.rerun()
+
+                # Answer annotation
+                with st.expander("📝 Add annotation", expanded=False):
+                    ann_key = f"annotation_input_{trace_id}"
+                    annotation_text = st.text_area("Your note", key=ann_key, height=60, label_visibility="collapsed", placeholder="Add a note to this answer…")
+                    if st.button("Save note", key=f"save_ann_{trace_id}"):
+                        st.session_state[f"annotation_{trace_id}"] = annotation_text
+                        st.toast("Note saved.")
+
+            annotation_saved = st.session_state.get(f"annotation_{trace_id}", "")
             st.session_state.chat_history.append(
                 {
                     "role": "assistant",
@@ -1042,7 +1500,7 @@ else:
                     "question": prompt,
                     "answer": answer,
                     "cards": message_cards,
-                    "sources": sources if isinstance(sources, list) else [],
+                    "sources": source_list,
                     "trace_id": trace_id,
                     "answer_mode": answer_mode,
                     "needs_clarification": needs_clarification,
@@ -1050,6 +1508,20 @@ else:
                     "confidence_score": confidence_score,
                     "fallback_reason": fallback_reason,
                     "follow_up_suggestion": follow_up_suggestion,
+                    "next_actions": next_actions,
+                    "applied_context": result_applied_context,
                     "meta": meta,
+                    "annotation": annotation_saved,
+                    "suggestions": suggestions,
                 }
             )
+            try:
+                client.save_search(
+                    session_id=st.session_state.session_id,
+                    query=prompt,
+                    filters=filters,
+                    applied_context=result_applied_context or applied_context,
+                    pinned=False,
+                )
+            except Exception:
+                pass

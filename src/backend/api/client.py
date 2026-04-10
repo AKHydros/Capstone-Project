@@ -37,6 +37,7 @@ class ApiClient:
         inference: dict[str, int | float] | None = None,
         input_method: str = "document",
         conversation_context: list[dict[str, str]] | None = None,
+        applied_context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Calls `/api/agent-router` remotely or local router fallback."""
         payload = {
@@ -50,6 +51,7 @@ class ApiClient:
             "inference": inference or {},
             "input_method": input_method,
             "conversation_context": conversation_context or [],
+            "applied_context": applied_context or {},
         }
         return self._remote_or_fallback(
             lambda: self._post_json("/api/agent-router", payload),
@@ -64,6 +66,7 @@ class ApiClient:
                 inference=inference or {},
                 input_method=input_method,
                 conversation_context=conversation_context or [],
+                applied_context=applied_context or {},
             ),
         )
 
@@ -205,6 +208,68 @@ class ApiClient:
             lambda: self.artifacts.observability_store.unanswered_analytics(limit=limit),
         )
 
+    def save_search(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        filters: dict[str, str | None],
+        applied_context: dict[str, str | None],
+        pinned: bool = False,
+    ) -> dict[str, Any]:
+        """Stores query/filter snapshot for reopen workflows."""
+        payload = {
+            "session_id": session_id,
+            "query": query,
+            "filters": filters,
+            "applied_context": applied_context,
+            "pinned": bool(pinned),
+        }
+        return self._remote_or_fallback(
+            lambda: self._post_json("/api/searches", payload),
+            lambda: {
+                "search_id": self.artifacts.observability_store.save_search(
+                    session_id=session_id,
+                    user_role=self.user_role,
+                    query_text=query,
+                    filters=filters,
+                    applied_context=applied_context,
+                    pinned=bool(pinned),
+                ),
+                "stored": True,
+            },
+        )
+
+    def list_searches(
+        self,
+        *,
+        limit: int = 25,
+        session_id: str | None = None,
+        pinned_only: bool = False,
+    ) -> dict[str, Any]:
+        """Returns recent saved searches."""
+        params: dict[str, object] = {"limit": limit, "pinned_only": pinned_only}
+        if session_id:
+            params["session_id"] = session_id
+        return self._remote_or_fallback(
+            lambda: self._get_json("/api/searches", params=params),
+            lambda: {
+                "items": self.artifacts.observability_store.list_saved_searches(
+                    limit=limit,
+                    session_id=session_id,
+                    user_role=self.user_role,
+                    pinned_only=pinned_only,
+                )
+            },
+        )
+
+    def reopen_search(self, *, search_id: int) -> dict[str, Any]:
+        """Marks a saved search as reopened and returns entry payload."""
+        return self._remote_or_fallback(
+            lambda: self._post_json(f"/api/searches/{search_id}/reopen", {}),
+            lambda: {"item": self.artifacts.observability_store.reopen_saved_search(search_id=search_id)},
+        )
+
     def _local_agent_router(
         self,
         *,
@@ -218,6 +283,7 @@ class ApiClient:
         inference: dict[str, int | float],
         input_method: str,
         conversation_context: list[dict[str, str]],
+        applied_context: dict[str, str],
     ) -> dict[str, Any]:
         """Local adapter call into `AgentRouterService.handle`."""
         output = self.artifacts.agent_router_service.handle(
@@ -232,6 +298,7 @@ class ApiClient:
                 inference=inference,
                 input_method=input_method,
                 conversation_context=conversation_context,
+                applied_context=applied_context,
                 user_role=self.user_role,
             )
         )
@@ -254,6 +321,8 @@ class ApiClient:
             "unanswered_reason": output.unanswered_reason,
             "fallback_reason": output.fallback_reason,
             "follow_up_suggestion": output.follow_up_suggestion,
+            "applied_context": output.applied_context,
+            "suggestions": output.suggestions,
         }
 
     def _local_compliance_status(self) -> dict[str, Any]:
