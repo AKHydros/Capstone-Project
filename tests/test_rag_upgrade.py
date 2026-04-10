@@ -51,11 +51,17 @@ def make_records() -> list[QuestionRecord]:
     ]
 
 
+def _build_retriever_without_openai() -> HybridRetriever:
+    """Build retriever in local semantic mode without reading real keys from `.env`."""
+    with patch("backend.llm.key_utils._dotenv_key_values", return_value={}):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "", "OPEN_API_KEY": ""}, clear=False):
+            return HybridRetriever.build(make_records())
+
+
 class RagUpgradeTests(unittest.TestCase):
     def test_hybrid_search_returns_stable_top_result(self) -> None:
         """Assert repeated hybrid queries keep the same top-ranked record."""
-        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
-            retriever = HybridRetriever.build(make_records())
+        retriever = _build_retriever_without_openai()
 
         first = retriever.search_with_details("annual household income", survey_name="PMG22_WAI")
         second = retriever.search_with_details("annual household income", survey_name="PMG22_WAI")
@@ -67,8 +73,7 @@ class RagUpgradeTests(unittest.TestCase):
 
     def test_confidence_gate_skips_llm_for_high_confidence_queries(self) -> None:
         """Assert confidence gates keep response deterministic and skip LLM calls."""
-        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
-            retriever = HybridRetriever.build(make_records())
+        retriever = _build_retriever_without_openai()
         llm = StubLlmClient()
 
         with patch.dict(
@@ -94,8 +99,7 @@ class RagUpgradeTests(unittest.TestCase):
 
     def test_llm_synthesis_uses_answer_cache_on_repeated_queries(self) -> None:
         """Assert repeated synthesis queries hit answer cache after first LLM call."""
-        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
-            retriever = HybridRetriever.build(make_records())
+        retriever = _build_retriever_without_openai()
         llm = StubLlmClient()
 
         with patch.dict(
@@ -135,8 +139,7 @@ class RagUpgradeTests(unittest.TestCase):
         prior turns, so the cache key now excludes context — the second call
         should hit the cache and not invoke the LLM again.
         """
-        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
-            retriever = HybridRetriever.build(make_records())
+        retriever = _build_retriever_without_openai()
         llm = StubLlmClient()
 
         with patch.dict(

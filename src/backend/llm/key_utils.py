@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from functools import lru_cache
 import os
 
 from dotenv import dotenv_values, find_dotenv
@@ -9,7 +8,6 @@ from dotenv import dotenv_values, find_dotenv
 OPENAI_KEY_ENV_VARS: tuple[str, ...] = ("OPENAI_API_KEY", "OPEN_API_KEY")
 
 
-@lru_cache(maxsize=1)
 def _dotenv_key_values() -> dict[str, str]:
     """Load key-related values from `.env` without mutating process env."""
     dotenv_path = find_dotenv(usecwd=True)

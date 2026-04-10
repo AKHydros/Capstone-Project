@@ -10,13 +10,27 @@ from .key_utils import resolve_openai_api_key
 class OpenAIChatClient:
     def __init__(self) -> None:
         """Initializes OpenAI client if key is configured and sets default model."""
-        api_key = resolve_openai_api_key()
         self.model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
-        self.client = OpenAI(api_key=api_key) if api_key else None
+        self.client = None
+        self._api_key = ""
+        self._refresh_client_from_env()
+
+    def _refresh_client_from_env(self) -> None:
+        """Sync client instance with the latest configured key value."""
+        api_key = resolve_openai_api_key()
+        if not api_key:
+            self.client = None
+            self._api_key = ""
+            return
+        if self.client is not None and api_key == self._api_key:
+            return
+        self.client = OpenAI(api_key=api_key)
+        self._api_key = api_key
 
     @property
     def enabled(self) -> bool:
         """Indicates whether chat client is configured and available."""
+        self._refresh_client_from_env()
         return self.client is not None
 
     def summarize(
@@ -30,6 +44,7 @@ class OpenAIChatClient:
         temperature: float | None = None,
     ) -> str:
         """Sends grounded chat prompts to OpenAI Responses API and returns text."""
+        self._refresh_client_from_env()
         if not self.client:
             raise RuntimeError("OpenAI client is not configured (set OPENAI_API_KEY or OPEN_API_KEY)")
 
