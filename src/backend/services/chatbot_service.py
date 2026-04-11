@@ -27,6 +27,43 @@ _CONTEXT_FIELD_DISPLAY: dict[str, str] = {
 }
 _DEFAULT_CONTEXT_FIELDS: tuple[str, ...] = ("position", "label", "measurement_level", "role")
 
+# ---------------------------------------------------------------------------
+# Meta-query patterns — detect existence-check intent
+# "Did you ask about X?", "Does survey Y contain X?", "Were there questions on X?"
+# These bypass semantic retrieval and use lexical matching against question text.
+# ---------------------------------------------------------------------------
+_META_QUERY_PATTERNS: tuple[str, ...] = (
+    r"\bdid you ask\b",
+    r"\bdoes (?:the )?survey (?:have|include|contain)\b",
+    r"\bis there (?:a )?question about\b",
+    r"\bare there (?:any )?questions? (?:about|on|regarding|related to)\b",
+    r"\bwere there (?:any )?questions? (?:about|on|regarding)\b",
+    r"\bdo(?:es)? (?:[A-Za-z]{3}\d{2}_[A-Za-z]{3}|\w+) (?:have|include|contain|ask)\b",
+    r"\bdo you have (?:any )?questions? (?:about|on|regarding)\b",
+    r"\bwhat questions? (?:were asked|exist|are there) (?:about|on|regarding)\b",
+    r"\bdoes .+ cover\b",
+)
+
+# Stop words stripped when extracting grounding keywords from a query.
+# Keeps only meaningful domain content terms for post-retrieval validation.
+_GROUNDING_STOP_WORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "must", "shall", "can", "need",
+    "in", "on", "at", "to", "for", "of", "with", "by", "from", "as",
+    "into", "through", "during", "before", "after", "above", "below",
+    "between", "about", "this", "that", "these", "those",
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her",
+    "us", "them", "my", "your", "his", "its", "our", "their",
+    "what", "which", "who", "whom", "how", "when", "where", "why",
+    "all", "any", "both", "each", "few", "more", "most", "other",
+    "some", "such", "no", "not", "only", "same", "so", "than", "too",
+    "very", "just", "tell", "show", "list", "find", "give", "get",
+    "let", "make", "know", "see", "look", "please", "want", "like",
+    "ask", "asking", "questions", "question", "survey", "pmg", "wave",
+    "record", "variable", "tell", "please", "show", "give",
+})
+
 
 @dataclass
 class ChatbotService:
@@ -115,6 +152,15 @@ class ChatbotService:
             self.answer_cache.set(exact_cache_key, self._serialize_chat_response(quick_response, cache_type="exact_lookup"))
             return quick_response
 
+        if self._is_meta_query_intent(query):
+            return self._meta_query_response(
+                query=query,
+                survey_name=survey_name,
+                wave_year=wave_year,
+                topic_label=topic_label,
+                topic_source_type=topic_source_type,
+            )
+
         if self._is_comparison_intent(query):
             pair = self._extract_two_surveys(query)
             if pair:
@@ -158,6 +204,35 @@ class ChatbotService:
                     "Try broader wording, remove filters, or check the question ID format."
                 ),
                 ranked_results=[],
+                retrieval_mode="deterministic",
+                answer_mode="direct_answer",
+                confidence_score=confidence,
+                embedding_cache_hit=embedding_cache_hit,
+                answer_cache_hit=False,
+                suggestions=suggestions,
+            )
+
+        # -----------------------------------------------------------------
+        # Grounding validation: if query keywords are absent from all
+        # returned card texts the retrieval has drifted semantically.
+        # Low-confidence drift returns a rejection notice rather than a
+        # misleading answer.  High-confidence hits are trusted as-is.
+        # -----------------------------------------------------------------
+        query_keywords = self._extract_query_keywords(query)
+        if (
+            query_keywords
+            and not self._grounding_check(cards, query_keywords)
+            and confidence < 0.50
+        ):
+            suggestions = self._build_did_you_mean(query)
+            mismatch_preview = "; ".join(c.question_text[:60] for c in cards[:3])
+            return ChatResponse(
+                answer=_sanitize_answer(
+                    "The retrieved records do not appear to directly address your query. "
+                    f"The closest semantic matches cover: {mismatch_preview}. "
+                    "Try rephrasing with specific question IDs, survey tokens, or exact topic wording."
+                ),
+                ranked_results=cards,
                 retrieval_mode="deterministic",
                 answer_mode="direct_answer",
                 confidence_score=confidence,
@@ -754,6 +829,246 @@ class ChatbotService:
             ]
         except Exception:  # noqa: BLE001
             return []
+
+    def _is_meta_query_intent(self, query: str) -> bool:
+        """Detect existence-check queries about survey content.
+
+        Matches phrasings such as "did you ask about ETFs in PMG18_ROB?",
+        "does the survey contain questions on employment?", or "were there
+        questions about exchange traded funds?".
+
+        These queries must NOT be routed through semantic retrieval — doing so
+        causes semantic drift (e.g. "exchange traded funds" matching "Financial
+        Decisions" because of embedding similarity).  Instead they are handled
+        by ``_meta_query_response`` which runs a direct lexical match against
+        ``question_text`` and ``value_labels``.
+
+        Parameters
+        ----------
+        query : str
+            Raw user query string.
+
+        Returns
+        -------
+        bool
+        """
+        lowered = query.lower()
+        return any(re.search(pattern, lowered) for pattern in _META_QUERY_PATTERNS)
+
+    def _extract_meta_subject(self, query: str) -> str:
+        """Extract the topic term from a meta-query for lexical matching.
+
+        Looks for the noun phrase that follows "about", "on", "regarding",
+        "related to", or "cover" and strips surrounding noise (survey tokens,
+        question marks, leading articles).
+
+        Parameters
+        ----------
+        query : str
+            A meta-query string, e.g. ``"Did PMG18_ROB ask about exchange
+            traded funds?"``.
+
+        Returns
+        -------
+        str
+            The extracted subject term (lower-cased), or an empty string when
+            no marker is found.
+        """
+        lowered = query.strip().lower()
+        # Remove survey tokens so they don't bleed into the subject
+        cleaned = re.sub(r"\b[a-z]{3}\d{2}_[a-z]{3}\b", "", lowered).strip()
+        for marker in ("related to", "regarding", "about", "on", "cover", "covers"):
+            idx = cleaned.find(f" {marker} ")
+            if idx != -1:
+                subject = cleaned[idx + len(marker) + 2:].strip().rstrip("?").strip()
+                # Strip leading articles
+                subject = re.sub(r"^(?:a |an |the )", "", subject).strip()
+                if subject:
+                    return subject
+        return ""
+
+    def _meta_query_response(
+        self,
+        *,
+        query: str,
+        survey_name: str | None,
+        wave_year: str | None,
+        topic_label: str | None,
+        topic_source_type: str | None,
+    ) -> ChatResponse:
+        """Answer existence-check meta-queries using direct lexical matching.
+
+        Rather than embedding-based retrieval (which causes semantic drift),
+        this method filters records to the specified survey then checks each
+        record's ``question_text`` and ``value_labels`` for the subject term
+        extracted from the query.  It reports exact matches, preventing false
+        positives caused by topically adjacent but unrelated records.
+
+        Parameters
+        ----------
+        query : str
+            The user's meta-query, e.g. ``"On PMG18_ROB did you ask any
+            questions about Exchange traded funds?"``.
+        survey_name : str | None
+            Active survey filter (from session state), overridden by any
+            survey token found inside the query itself.
+        wave_year : str | None
+            Optional wave-year filter.
+        topic_label : str | None
+            Optional topic-label filter.
+        topic_source_type : str | None
+            Optional topic-source-type filter.
+
+        Returns
+        -------
+        ChatResponse
+            ``answer_mode="direct_answer"`` with ``confidence_score=1.0`` when
+            matches are found, ``0.0`` when absent.
+        """
+        subject = self._extract_meta_subject(query)
+        if not subject:
+            return ChatResponse(
+                answer=_sanitize_answer(
+                    "I can check whether a topic appears in the survey, but I could not "
+                    "identify the subject term. Please rephrase — for example: "
+                    "'Does PMG18_ROB have questions about exchange traded funds?'"
+                ),
+                ranked_results=[],
+                retrieval_mode="deterministic",
+                answer_mode="clarifier",
+                needs_clarification=True,
+            )
+
+        query_survey = self._extract_survey_name(query)
+        resolved_survey = survey_name or query_survey
+
+        filtered_records = apply_filters(
+            self.retriever.records,
+            survey_name=resolved_survey,
+            wave_year=wave_year,
+            topic_label=topic_label,
+            topic_source_type=topic_source_type,
+        )
+
+        # Split subject into individual terms (>3 chars) for word-level fallback
+        subject_terms = [
+            t for t in re.split(r"\s+", subject)
+            if len(t.strip()) > 3
+        ]
+
+        exact_matches: list[QuestionRecord] = []
+        seen_ids: set[str] = set()
+        for record in filtered_records:
+            searchable = (
+                record.question_text.lower()
+                + " "
+                + " ".join(record.value_labels).lower()
+            )
+            matched = subject in searchable or any(t in searchable for t in subject_terms)
+            if matched and record.question_id not in seen_ids:
+                seen_ids.add(record.question_id)
+                exact_matches.append(record)
+
+        exact_matches = exact_matches[: CHAT_RULES.max_cards_display]
+        survey_label = f" in **{resolved_survey}**" if resolved_survey else ""
+
+        if exact_matches:
+            lines = [
+                f"Yes, the survey{survey_label} contains **{len(exact_matches)}** "
+                f"question(s) related to **{subject}**:\n"
+            ]
+            for r in exact_matches[:6]:
+                lines.append(f"- **{r.question_id}** — {r.question_text}")
+            answer = _sanitize_answer("\n".join(lines))
+            score = 1.0
+        else:
+            answer = _sanitize_answer(
+                f"No, the survey{survey_label} does not appear to contain questions "
+                f"specifically about **{subject}** based on a direct match in question "
+                "wording and response labels. If you believe the topic is present, try "
+                "alternate wording or check the topic labels via 'Browse Topics'."
+            )
+            score = 0.0
+
+        return ChatResponse(
+            answer=answer,
+            ranked_results=exact_matches,
+            retrieval_mode="deterministic",
+            answer_mode="direct_answer",
+            confidence_score=score,
+            embedding_cache_hit=False,
+            answer_cache_hit=False,
+        )
+
+    def _extract_query_keywords(self, query: str) -> list[str]:
+        """Extract meaningful content terms from a query for grounding validation.
+
+        Strips survey tokens, question-reference markers, and stop words to
+        isolate the specific topic the user is asking about.  The returned list
+        is used by ``_grounding_check`` to verify that retrieved cards actually
+        address the query.
+
+        Parameters
+        ----------
+        query : str
+            Raw user query string.
+
+        Returns
+        -------
+        list[str]
+            Ordered, deduplicated content terms (lower-cased, ≥ 4 chars).
+        """
+        # Remove survey tokens (PMG18_ROB, etc.)
+        cleaned = re.sub(r"\b[A-Za-z]{3}\d{2}_[A-Za-z]{3}\b", "", query, flags=re.IGNORECASE)
+        # Remove question references (q5, q5a, question 5)
+        cleaned = re.sub(r"\bq(?:uestion)?\s*\d+[a-z]?\b", "", cleaned, flags=re.IGNORECASE)
+        # Tokenize — keep words ≥ 4 chars
+        tokens = re.findall(r"\b[a-z]{4,}\b", cleaned.lower())
+        # Remove stop words
+        keywords = [t for t in tokens if t not in _GROUNDING_STOP_WORDS]
+        # Deduplicate preserving order
+        seen: set[str] = set()
+        unique: list[str] = []
+        for kw in keywords:
+            if kw not in seen:
+                seen.add(kw)
+                unique.append(kw)
+        return unique
+
+    def _grounding_check(self, cards: list[QuestionRecord], keywords: list[str]) -> bool:
+        """Return True if at least one top card's text contains a query keyword.
+
+        Used as a post-retrieval validation gate to detect semantic drift —
+        cases where embedding similarity surfaces topically adjacent records
+        that do not actually address the user's specific subject.
+
+        For example, a query about "exchange traded funds" might return records
+        about "Financial Decisions" (semantically related but factually wrong).
+        This check catches that mismatch before the answer is synthesised.
+
+        Only the top 3 ranked cards are checked: if none contain a keyword the
+        retrieval result is considered ungrounded.
+
+        Parameters
+        ----------
+        cards : list[QuestionRecord]
+            Ranked retrieved records.
+        keywords : list[str]
+            Content terms extracted by ``_extract_query_keywords``.
+
+        Returns
+        -------
+        bool
+            ``True`` when grounded (safe to answer), ``False`` when ungrounded.
+        """
+        if not keywords or not cards:
+            return True  # Cannot validate — fall through to normal path
+
+        for card in cards[:3]:
+            searchable = card.question_text.lower() + " " + " ".join(card.value_labels).lower()
+            if any(kw in searchable for kw in keywords):
+                return True
+        return False
 
     def _is_comparison_intent(self, query: str) -> bool:
         """Return True when the query expresses a cross-survey comparison intent.

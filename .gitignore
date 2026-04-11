@@ -1,0 +1,83 @@
+# ============================================================
+# Secrets & credentials — NEVER commit
+# ============================================================
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ============================================================
+# Claude Code & Codex — local tooling configs (not for repo)
+# ============================================================
+.claude/
+.codex/
+
+# ============================================================
+# Source data & PII — survey files, respondent data
+# ============================================================
+data/*.xlsx
+data/*.xls
+data/*.docx
+data/*.doc
+data/~$*          # Word/Excel temp lock files
+
+# ============================================================
+# Runtime databases & event logs — contain PII / session data
+# ============================================================
+data/observability.db
+data/observability.db-shm
+data/observability.db-wal
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/logs/
+
+# ============================================================
+# Cached index artefacts — derived, reproducible
+# ============================================================
+data/cache/
+
+# ============================================================
+# Python build artefacts
+# ============================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ============================================================
+# Virtual environment
+# ============================================================
+.venv/
+venv/
+env/
+ENV/
+
+# ============================================================
+# OS & editor noise
+# ============================================================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# ============================================================
+# Test / coverage artefacts
+# ============================================================
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

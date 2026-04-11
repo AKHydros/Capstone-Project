@@ -22,25 +22,29 @@ _BLOCKED_TOPICS = (
 # clearly off-topic requests (weather, cooking, sports, general knowledge, etc.)
 # ---------------------------------------------------------------------------
 _DOMAIN_KEYWORDS: tuple[str, ...] = (
-    # Survey / research artefacts
+    # Survey / research artefacts — clearly in-scope signals
     "survey", "wave", "question", "variable", "label", "value", "record",
     "pmg", "dictionary", "data dictionary", "codebook",
-    # Question / item references
+    # Question / item ID references — unambiguous survey context
     "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q10",
     "q11", "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20",
     "_q", "_gam", "_wai", "_rob",
-    # Research / analytics language
+    # Research methodology language — survey-specific terms
     "measurement", "measurement level", "nominal", "ordinal", "scale",
     "respondent", "segment", "cohort", "panel", "demographic",
-    "financial", "trust", "sentiment", "digital", "product", "provider",
-    "advisor", "bank", "mortgage", "investment", "retirement", "income",
+    # Financial-research terms — domain specific (present in PMG surveys)
+    "trust", "sentiment", "provider", "advisor", "mortgage",
+    "investment", "retirement", "income",
+    # Data dictionary / lookup terms
     "allowable", "allowed value", "coded", "response option", "category",
-    "topic", "mapping", "lookup", "grounded", "retrieval", "filter",
-    # Analytical intent words that are clearly about the dictionary
-    "summarize", "summary", "explain", "compare", "trend", "pattern",
-    "overview", "breakdown", "describe", "insight", "analysis",
-    "what is", "what are", "which", "how many", "tell me about",
-    "show me", "list", "find", "search",
+    "topic label", "mapping", "lookup", "grounded", "retrieval", "filter",
+    "lineage", "wave year", "value label",
+    # Analytical intent — kept only when paired with unambiguous survey context
+    # NOTE: generic single-word verbs (list, find, show, which, search, explain,
+    # summarize, compare, trend, pattern, overview, breakdown, describe, analysis)
+    # are intentionally removed.  They matched nearly any English sentence and
+    # defeated the purpose of domain scoping.  Legitimate survey queries will
+    # still pass via the survey-specific terms above.
 )
 
 # Explicit out-of-domain patterns — greet the user but redirect if matched.
