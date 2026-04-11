@@ -61,7 +61,9 @@ _OUT_OF_DOMAIN_PATTERNS: tuple[str, ...] = (
 
 # Queries shorter than this character threshold bypass domain checking
 # (they are likely greetings / clarifications like "yes", "ok", "thanks").
-_DOMAIN_CHECK_MIN_CHARS = 12
+# Set to 6 so single-word off-topic queries like "weather" (7 chars) are
+# still domain-checked, while true greetings ("hi", "ok") pass through.
+_DOMAIN_CHECK_MIN_CHARS = 6
 
 
 @dataclass(frozen=True)

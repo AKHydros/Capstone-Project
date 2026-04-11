@@ -24,7 +24,7 @@ class InferenceSettings(BaseModel):
 class AgentRouterRequest(BaseModel):
     trace_id: str | None = None
     session_id: str
-    query: str
+    query: str = Field(..., min_length=1, max_length=2000)
     language: str = "en"
     filters: RouterFilters = Field(default_factory=RouterFilters)
     mode: str = "hybrid"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from functools import lru_cache
+from functools import lru_cache  # kept for other callers; build_runtime uses st.cache_resource
 import json
 from pathlib import Path
 import re
@@ -20,9 +20,15 @@ from ui.style import apply_pmg_theme
 _ET_TZ = ZoneInfo("America/Toronto")
 
 
-@lru_cache(maxsize=1)
+@st.cache_resource(show_spinner=False)
 def build_runtime(force_rebuild_cache: bool = False, force_refresh_prompts: bool = False) -> BootstrapArtifacts:
-    """Builds UI runtime artifacts (cached) via backend bootstrap."""
+    """Builds UI runtime artifacts (Streamlit resource cache) via backend bootstrap.
+
+    ``@st.cache_resource`` is preferred over ``@lru_cache`` for Streamlit
+    because it survives hot-reloads, is shared across browser sessions in
+    multi-user deployments, and is properly invalidated by ``cache_clear()``.
+    ``show_spinner=False`` lets the call-site control the spinner wording.
+    """
     config = load_config()
     return BootstrapService(config).build(
         force_rebuild_cache=force_rebuild_cache,
@@ -100,14 +106,52 @@ def _init_state() -> None:
         st.session_state.batch_lookup_results = None
 
 
-def _save_uploaded_files(uploads_dir: Path, uploaded_files: list[object] | None) -> int:
-    """Persists uploaded files and returns count saved."""
+_UPLOAD_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
+_UPLOAD_MAGIC: dict[str, bytes] = {
+    "xlsx": b"PK\x03\x04",  # OOXML (ZIP-based)
+    "docx": b"PK\x03\x04",
+}
+_SAFE_FILENAME_RE = re.compile(r"[^\w.\-]")
+
+
+def _validate_upload(file: object) -> str | None:
+    """Returns an error string if the file is invalid, or None if OK.
+
+    Checks:
+    * File size ≤ 20 MB.
+    * Magic bytes match the declared extension (prevents extension spoofing).
+    * Filename contains only safe characters after sanitization.
+    """
+    size = getattr(file, "size", None)
+    if size is not None and size > _UPLOAD_MAX_BYTES:
+        return f"{file.name}: exceeds 20 MB limit ({size // (1024*1024)} MB)"
+    ext = Path(file.name).suffix.lstrip(".").lower()
+    expected_magic = _UPLOAD_MAGIC.get(ext)
+    if expected_magic is not None:
+        header = bytes(file.getbuffer()[:4])
+        if header != expected_magic:
+            return f"{file.name}: file content does not match .{ext} format"
+    return None
+
+
+def _save_uploaded_files(uploads_dir: Path, uploaded_files: list[object] | None) -> tuple[int, list[str]]:
+    """Validates, sanitizes, and persists uploaded files.
+
+    Returns ``(saved_count, errors)`` where ``errors`` is a list of
+    human-readable validation failure messages.
+    """
     saved_count = 0
+    errors: list[str] = []
     for file in uploaded_files or []:
-        target = uploads_dir / file.name
+        error = _validate_upload(file)
+        if error:
+            errors.append(error)
+            continue
+        safe_name = _SAFE_FILENAME_RE.sub("_", file.name)
+        target = uploads_dir / safe_name
         target.write_bytes(file.getbuffer())
         saved_count += 1
-    return saved_count
+    return saved_count, errors
 
 
 def _cache_status_text(artifacts: BootstrapArtifacts) -> tuple[str, str, str, str]:
@@ -810,14 +854,16 @@ with st.sidebar:
                 key="sidebar_uploader",
             )
             if st.button("Add Uploaded Files", use_container_width=True, key="sidebar_add_files"):
-                saved_count = _save_uploaded_files(uploads_dir, uploaded_files)
+                saved_count, upload_errors = _save_uploaded_files(uploads_dir, uploaded_files)
+                for err in upload_errors:
+                    st.error(err)
                 if saved_count > 0:
                     _request_cache_action(
                         rebuild=True,
                         refresh_prompts=True,
                         toast_message=f"Added {saved_count} file(s). Cache and prompts refreshed.",
                     )
-                else:
+                elif not upload_errors:
                     st.toast("No files selected.")
 
     if user_role in {"analyst", "admin"}:

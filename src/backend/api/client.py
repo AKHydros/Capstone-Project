@@ -470,8 +470,8 @@ class ApiClient:
             return response.json()
 
     def _headers(self, *, include_auth: bool) -> dict[str, str]:
-        """Builds request headers, including internal token when required."""
+        """Builds request headers, using standard Bearer auth when required."""
         headers = {"accept": "application/json"}
         if include_auth:
-            headers["x-internal-token"] = self.config.api_internal_token
+            headers["Authorization"] = f"Bearer {self.config.api_internal_token}"
         return headers

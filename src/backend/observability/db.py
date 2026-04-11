@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import re
 import sqlite3
 import threading
 from typing import Any
@@ -52,7 +53,9 @@ class ObservabilityStore:
                     ended_at TEXT,
                     locale TEXT,
                     consent INTEGER DEFAULT 0,
-                    completion_status TEXT DEFAULT 'open'
+                    completion_status TEXT DEFAULT 'open',
+                    last_active_at TEXT,
+                    token_hash TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS events (
@@ -183,41 +186,62 @@ class ObservabilityStore:
                 CREATE INDEX IF NOT EXISTS idx_saved_searches_session_id ON saved_searches(session_id);
                 CREATE INDEX IF NOT EXISTS idx_saved_searches_similarity ON saved_searches(similarity_key);
                 CREATE INDEX IF NOT EXISTS idx_saved_searches_pinned ON saved_searches(pinned);
+                CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at);
                 """
             )
             conn.commit()
+            # --- migrations for existing databases ---
+            for _col, _ddl in (
+                ("last_active_at", "ALTER TABLE sessions ADD COLUMN last_active_at TEXT"),
+                ("token_hash",     "ALTER TABLE sessions ADD COLUMN token_hash TEXT"),
+            ):
+                try:
+                    conn.execute(_ddl)
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
-    def record_session_start(self, session_id: str, locale: str, consent: bool) -> None:
-        """Inserts session if absent with locale/consent state."""
+    def record_session_start(
+        self, session_id: str, locale: str, consent: bool, token_hash: str = ""
+    ) -> None:
+        """Inserts session if absent with locale/consent state and owner token hash."""
         now = _now()
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO sessions(session_id, started_at, locale, consent, completion_status)
-                VALUES(?, ?, ?, ?, 'open')
-                ON CONFLICT(session_id) DO NOTHING
+                INSERT INTO sessions(session_id, started_at, locale, consent, completion_status,
+                                     last_active_at, token_hash)
+                VALUES(?, ?, ?, ?, 'open', ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET last_active_at=excluded.last_active_at
                 """,
-                (session_id, now, locale, int(consent)),
+                (session_id, now, locale, int(consent), now, token_hash or None),
             )
             conn.commit()
 
     def ensure_session_and_get_consent(self, session_id: str, locale: str) -> bool:
-        """Ensures session row exists and returns current consent flag."""
+        """Ensures session row exists, bumps last_active_at, and returns current consent flag."""
+        now = _now()
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT consent FROM sessions WHERE session_id=?",
                 (session_id,),
             ).fetchone()
             if row is not None:
+                conn.execute(
+                    "UPDATE sessions SET last_active_at=? WHERE session_id=?",
+                    (now, session_id),
+                )
+                conn.commit()
                 return bool(row["consent"])
 
             conn.execute(
                 """
-                INSERT INTO sessions(session_id, started_at, locale, consent, completion_status)
-                VALUES(?, ?, ?, ?, 'open')
+                INSERT INTO sessions(session_id, started_at, locale, consent, completion_status,
+                                     last_active_at)
+                VALUES(?, ?, ?, ?, 'open', ?)
                 ON CONFLICT(session_id) DO NOTHING
                 """,
-                (session_id, _now(), locale, 0),
+                (session_id, now, locale, 0, now),
             )
             conn.commit()
             return False
@@ -229,6 +253,39 @@ class ObservabilityStore:
         if row is None:
             return False
         return bool(row["consent"])
+
+    def session_owner_hash(self, session_id: str) -> str | None:
+        """Returns the token_hash for a session, or None if unset / session absent."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT token_hash FROM sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["token_hash"]) if row["token_hash"] else None
+
+    def expire_stale_sessions(self, *, idle_hours: int = 24) -> int:
+        """Marks sessions that have been idle for more than *idle_hours* as 'expired'.
+
+        A session is considered idle when ``last_active_at`` (or ``started_at``
+        as a fallback) is older than the given threshold.  Returns the number
+        of sessions updated.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=idle_hours)).isoformat(
+            timespec="seconds"
+        )
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE sessions
+                SET completion_status='expired', ended_at=?
+                WHERE completion_status='open'
+                  AND COALESCE(last_active_at, started_at) < ?
+                """,
+                (_now(), cutoff),
+            )
+            conn.commit()
+            return cur.rowcount
 
     def record_session_end(self, session_id: str, completion_status: str = "completed") -> None:
         """Marks session end time and completion status."""
@@ -311,8 +368,20 @@ class ObservabilityStore:
         takeaways: list[str],
         route_used: str,
         fallback_used: bool,
+        logging_level: str = "full",
     ) -> None:
-        """Inserts query/response pair for audit and analytics."""
+        """Inserts query/response pair for audit and analytics.
+
+        PII is always scrubbed from stored text using the same regex patterns
+        as ``SafetyService.redact_pii``.  When ``logging_level`` is ``"minimal"``
+        the response body is replaced with a placeholder — only the query
+        (post-redaction) and metadata are retained for analytics purposes.
+        """
+        query_text = _redact_pii(query_text)
+        if logging_level == "minimal":
+            response_text = "[redacted — minimal logging consent]"
+        else:
+            response_text = _redact_pii(response_text)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -836,3 +905,14 @@ def _similarity_key(query_norm: str, *, max_tokens: int = 5) -> str:
     if not tokens:
         return "empty"
     return " ".join(tokens[:max_tokens])
+
+
+def _redact_pii(text: str) -> str:
+    """Redacts email addresses and phone numbers before persistence.
+
+    Mirrors ``SafetyService.redact_pii`` without importing that class here
+    to avoid a circular dependency between the observability and services layers.
+    """
+    text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[redacted-email]", text)
+    text = re.sub(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", "[redacted-phone]", text)
+    return text

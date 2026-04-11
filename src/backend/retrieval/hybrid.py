@@ -59,8 +59,30 @@ class HybridRetriever:
         topic_source_type: str | None = None,
         top_k: int | None = None,
     ) -> HybridSearchResult:
-        """Runs weighted lexical+semantic ranking, filtering, and returns diagnostics."""
+        """Runs weighted lexical+semantic ranking, filtering, and returns diagnostics.
+
+        When ``survey_name`` is provided, record indices are pre-filtered before
+        the chunk-scoring loop so chunks belonging to other surveys are skipped
+        entirely.  This reduces the effective loop size from ``len(chunks)`` to
+        ``len(survey_chunks)`` — a significant win when most queries are scoped
+        to a single survey.
+
+        Diagnostics (``top_score``, ``score_gap``) are computed from pre-filter
+        scores, then ``apply_filters`` enforces additional wave/topic constraints.
+        """
         top_k = top_k or RETRIEVAL_RULES.top_k
+
+        # Pre-compute valid record indices for survey filter — O(n) once, saves
+        # O(n) filter work inside the chunk loop.
+        if survey_name:
+            survey_upper = survey_name.upper()
+            valid_record_indices: frozenset[int] | None = frozenset(
+                idx for idx, r in enumerate(self.records)
+                if r.survey_name.upper() == survey_upper
+            )
+        else:
+            valid_record_indices = None
+
         lexical_scores = self.lexical.score(query)
         exact_match_boosts = self._exact_match_boosts(query)
         try:
@@ -75,6 +97,10 @@ class HybridRetriever:
 
         chunk_scores: list[tuple[float, TextChunk]] = []
         for idx, chunk in enumerate(self.chunks):
+            # Skip chunks outside the active survey filter — avoids scoring
+            # irrelevant records when survey_name is set.
+            if valid_record_indices is not None and chunk.record_index not in valid_record_indices:
+                continue
             if idx >= len(lexical_scores) or idx >= len(semantic_scores):
                 continue
             score = (
@@ -181,8 +207,25 @@ class HybridRetriever:
         return [item.record for item in result.scored_results]
 
     def _exact_match_boosts(self, query: str) -> dict[int, float]:
-        """Computes deterministic score boosts for exact variable/question references in the query."""
+        """Computes deterministic score boosts for exact variable/question references in the query.
+
+        Returns an empty dict immediately when the query contains no survey token
+        (e.g. ``PMG18_ROB``) and no question reference (e.g. ``q5``), avoiding
+        an O(n) record scan that would contribute nothing.
+        """
         lowered = query.lower()
+
+        # Fast pre-check: skip full record scan when query has no IDs to match.
+        # Three patterns cover all reference forms:
+        #   full variable ID  — PMG20_GAM_q12a  (\b only at token start; _q suffix present)
+        #   standalone survey — PMG20_GAM        (\b required on both ends)
+        #   question ref      — q5 / question 5  (\b required before q)
+        has_full_id = bool(re.search(r"\b[a-z]{3}\d{2}_[a-z]{3}_q{1,2}\d+", lowered))
+        has_survey_token = bool(re.search(r"\b[a-z]{3}\d{2}_[a-z]{3}\b", lowered))
+        has_question_token = bool(re.search(r"\bq(?:uestion)?\s*\d+", lowered))
+        if not has_full_id and not has_survey_token and not has_question_token:
+            return {}
+
         boosts: dict[int, float] = {}
 
         full_id_matches = set(

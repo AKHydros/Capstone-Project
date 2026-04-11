@@ -9,17 +9,20 @@ description = "Conversational research data dictionary assistant"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "streamlit>=1.44.0",
-  "fastapi>=0.115.0",
-  "uvicorn>=0.32.0",
-  "gunicorn>=22.0.0",
-  "httpx>=0.28.0",
-  "pandas>=2.2.0",
-  "openpyxl>=3.1.0",
-  "scikit-learn>=1.5.0",
-  "numpy>=1.26.0",
-  "python-dotenv>=1.0.1",
-  "openai>=1.68.0"
+  # Pinned to compatible-release (~=) to prevent silent CVE auto-upgrades.
+  # Update intentionally; run `pip-audit` after each bump.
+  "streamlit~=1.55.0",
+  "fastapi~=0.135.0",
+  "uvicorn~=0.42.0",
+  "gunicorn~=25.3.0",
+  "httpx~=0.28.0",
+  "pandas~=2.3.0",
+  "openpyxl~=3.1.0",
+  "scikit-learn~=1.8.0",
+  "numpy~=2.4.0",
+  "python-dotenv~=1.2.0",
+  "openai~=2.26.0",
+  "slowapi~=0.1.9",
 ]
 
 [tool.setuptools]

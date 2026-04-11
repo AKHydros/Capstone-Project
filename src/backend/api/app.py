@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import hashlib
+import os
 import time
 import threading
 from typing import Annotated
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..config import load_config, resolve_api_role
 from ..services.agent_router_service import AgentRouterInput
@@ -60,17 +67,42 @@ def _rebuild_runtime(*, refresh_prompts: bool = False) -> BootstrapArtifacts:
         return _RUNTIME_INSTANCE
 
 
-def _auth_dependency(request: Request, x_internal_token: Annotated[str | None, Header()] = None) -> str:
-    """Enforces token auth and resolves role for protected API routes."""
+def _auth_dependency(
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+    x_internal_token: Annotated[str | None, Header()] = None,
+) -> str:
+    """Enforces token auth and resolves role for protected API routes.
+
+    Accepts tokens via two header schemes (in priority order):
+
+    1. ``Authorization: Bearer <token>`` — standard RFC 6750 scheme.
+    2. ``x-internal-token: <token>`` — legacy scheme kept for backward
+       compatibility with existing tooling; will be removed in a future version.
+
+    The ``/api/health/llm`` endpoint is intentionally public (no token required)
+    so monitoring infrastructure can probe LLM connectivity without credentials.
+    """
     if request.url.path == "/api/health/llm":
         request.state.user_role = "viewer"
+        request.state.token_hash = ""
         return "viewer"
-    token = (x_internal_token or "").strip()
+
+    # Prefer Authorization: Bearer, fall back to x-internal-token.
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[len("bearer "):].strip()
+    elif x_internal_token:
+        token = x_internal_token.strip()
+
     config = load_config()
     role = resolve_api_role(config, token)
     if role is None:
-        raise HTTPException(status_code=401, detail="Invalid internal token")
+        raise HTTPException(status_code=401, detail="Unauthorized")
     request.state.user_role = role
+    # Store a short hash of the token for session ownership checks (M5).
+    # Not the full token — just enough to verify the same caller.
+    request.state.token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
     return role
 
 
@@ -86,13 +118,57 @@ def _require_roles(*allowed_roles: str):
     return _dependency
 
 
+# ---------------------------------------------------------------------------
+# Rate limiter — keyed by remote IP.
+# Limits: 60 req/min on general routes, 30 req/min on the LLM-backed route.
+# ---------------------------------------------------------------------------
+_limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+
 app = FastAPI(title="Capstone Chatbot API", version="1.0.0")
+app.state.limiter = _limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ---------------------------------------------------------------------------
+# CORS — restrict cross-origin requests to known UI origins.
+# Override CORS_ALLOWED_ORIGINS env var (comma-separated) for production.
+# ---------------------------------------------------------------------------
+_cors_origins = [
+    o.strip()
+    for o in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:8501,http://127.0.0.1:8501").split(",")
+    if o.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["authorization", "x-internal-token", "x-trace-id", "content-type"],
+)
+
+
+class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Injects standard defensive HTTP response headers on every response."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("X-XSS-Protection", "1; mode=block")
+        return response
+
+
+app.add_middleware(_SecurityHeadersMiddleware)
 
 
 @app.on_event("startup")
 def warm_runtime() -> None:
-    """FastAPI startup hook that pre-warms runtime to avoid first-request cold-start latency."""
-    _runtime()
+    """FastAPI startup hook that pre-warms runtime and expires stale sessions (L3)."""
+    rt = _runtime()
+    expired = rt.observability_store.expire_stale_sessions(idle_hours=24)
+    if expired:
+        import logging as _logging
+        _logging.getLogger(__name__).info("Expired %d stale session(s) on startup.", expired)
 
 
 @app.middleware("http")
@@ -125,7 +201,12 @@ async def trace_middleware(request: Request, call_next):
             latency_ms=latency_ms,
             status="error",
         )
-        return JSONResponse(status_code=500, content={"detail": "Internal server error", "trace_id": trace_id})
+        # Only expose trace_id to analyst/admin roles — viewers get a generic error.
+        user_role = getattr(request.state, "user_role", "viewer")
+        body: dict[str, str] = {"detail": "Internal server error"}
+        if user_role in {"analyst", "admin"}:
+            body["trace_id"] = trace_id
+        return JSONResponse(status_code=500, content=body)
 
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
     response.headers["x-trace-id"] = trace_id
@@ -160,13 +241,30 @@ def get_auth_me(raw_request: Request) -> AuthMeResponse:
     response_model=ConsentRecordResponse,
     dependencies=[Depends(_require_roles("viewer", "analyst", "admin"))],
 )
-def post_consent_record(payload: ConsentRecordRequest) -> ConsentRecordResponse:
-    """Persists consent decisions and session logging level."""
+def post_consent_record(payload: ConsentRecordRequest, raw_request: Request) -> ConsentRecordResponse:
+    """Persists consent decisions and session logging level.
+
+    Enforces session ownership (M5): once a session has been registered by a
+    token, only the **same** token (identified by its SHA-256 prefix) may
+    modify its consent state.  A different token attempting to alter consent
+    for an existing session receives a 403.
+    """
     runtime = _runtime()
+    token_hash: str = getattr(raw_request.state, "token_hash", "")
+
+    # Check ownership of an existing session.
+    existing_hash = runtime.observability_store.session_owner_hash(payload.session_id)
+    if existing_hash is not None and token_hash and existing_hash != token_hash:
+        raise HTTPException(
+            status_code=403,
+            detail="Consent may only be modified by the session owner.",
+        )
+
     runtime.observability_store.record_session_start(
         payload.session_id,
         locale=payload.locale,
         consent=payload.user_consent,
+        token_hash=token_hash,
     )
     logging_level = "full" if payload.user_consent else "minimal"
     record_id = runtime.observability_store.record_consent(
@@ -206,6 +304,7 @@ def get_compliance_status() -> ComplianceStatusResponse:
     response_model=AgentRouterResponse,
     dependencies=[Depends(_require_roles("viewer", "analyst", "admin"))],
 )
+@_limiter.limit("30/minute")
 def post_agent_router(request: AgentRouterRequest, raw_request: Request) -> AgentRouterResponse:
     """Main chat route: converts API payload into router input and returns routed response payload."""
     runtime = _runtime()

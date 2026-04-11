@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import threading
 
 from ..business_rules import RETRIEVAL_RULES
 from ..cache.index_cache import CacheInspectResult, IndexCache, build_signature
@@ -115,7 +116,19 @@ class BootstrapService:
             rag_score_gap_threshold_override=self.config.rag_score_gap_threshold,
             rag_answer_cache_ttl_override=self.config.rag_answer_cache_ttl,
         )
-        question_library = question_library_service.preload(records, iterations=10)
+        # Preload question library in background — avoids 60 serial SQLite opens
+        # blocking the main startup path.  A daemon thread is used so it does
+        # not prevent process exit.  The result is available via the returned
+        # BootstrapArtifacts once the thread completes (worst-case sub-second).
+        _preload_result: list[object] = []
+
+        def _run_preload() -> None:
+            lib = question_library_service.preload(records, iterations=10)
+            _preload_result.append(lib)
+
+        preload_thread = threading.Thread(target=_run_preload, daemon=True)
+        preload_thread.start()
+
         agent_router_service = AgentRouterService(
             chatbot_service=service,
             store=observability_store,
@@ -130,13 +143,21 @@ class BootstrapService:
         waves = sorted({r.wave_year for r in records if r.wave_year})
         topics = sorted({topic for r in records for topic in r.topic_labels})
         topic_source_types = sorted({source for r in records for source in r.topic_label_sources.values()})
-        cache_status = cache.inspect(signature)
+
+        # Reuse startup_cache_status if nothing was rebuilt (avoids 2nd disk read).
+        # Re-inspect only when cache was just written so metadata reflects new state.
+        cache_status = cache.inspect(signature) if rebuilt else startup_cache_status
         index_version = cache_status.index_version or "runtime"
         index_signature = cache_status.signature or signature
         index_document_count = cache_status.document_count or len(records)
         index_chunk_count = cache_status.chunk_count or len(getattr(retriever, "chunks", []))
         index_embedding_mode = cache_status.embedding_mode or retriever.semantic.mode
         index_last_rebuild_epoch = cache_status.created_at_epoch
+
+        # Join preload thread with a short timeout — it is fast (pure Python +
+        # SQLite) so it finishes well before the main path reaches this line.
+        preload_thread.join(timeout=5.0)
+        question_library = _preload_result[0] if _preload_result else question_library_service.preload(records, iterations=10)
 
         return BootstrapArtifacts(
             chatbot_service=service,

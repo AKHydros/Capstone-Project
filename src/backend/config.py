@@ -97,7 +97,17 @@ def load_config() -> AppConfig:
         "LOGS_DIR",
         "data/logs",
     )
-    api_internal_token = os.getenv("API_INTERNAL_TOKEN", "dev-internal-token")
+    _raw_token = os.getenv("API_INTERNAL_TOKEN", "").strip()
+    if not _raw_token:
+        import warnings
+        warnings.warn(
+            "API_INTERNAL_TOKEN is not set. "
+            "Falling back to insecure default 'dev-internal-token'. "
+            "Set this env var before any shared or production deployment.",
+            stacklevel=2,
+        )
+        _raw_token = "dev-internal-token"
+    api_internal_token = _raw_token
     api_viewer_tokens = _parse_csv_env(os.getenv("API_VIEWER_TOKENS", "").strip())
     api_analyst_tokens = _parse_csv_env(os.getenv("API_ANALYST_TOKENS", "").strip())
     api_admin_tokens = _parse_csv_env(os.getenv("API_ADMIN_TOKENS", "").strip())
