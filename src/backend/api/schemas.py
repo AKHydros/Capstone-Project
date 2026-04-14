@@ -78,6 +78,8 @@ class AgentRouterResponse(BaseModel):
     follow_up_suggestion: str | None = None
     applied_context: dict[str, str] | None = None
     suggestions: list[str] = Field(default_factory=list)
+    reasoning: str | None = None
+    consistency_note: str | None = None
 
 
 class ConsentRecordRequest(BaseModel):

@@ -1236,6 +1236,13 @@ else:
                     _render_next_action_chips([str(action) for action in history_actions], key_prefix=f"hist_action_{idx}")
                 if msg.get("annotation"):
                     st.caption(f"📝 Note: {msg['annotation']}")
+                # Consistency note — shown when prior answer was returned
+                if msg.get("consistency_note"):
+                    st.caption(f"ℹ️ {msg['consistency_note']}")
+                # Reasoning expander — analyst/admin only (avoids cognitive overload for viewers)
+                if msg.get("reasoning") and user_role in ("analyst", "admin"):
+                    with st.expander("🧠 Reasoning", expanded=False):
+                        st.markdown(str(msg["reasoning"]))
             else:
                 st.markdown(str(msg.get("content", "")))
 
@@ -1407,6 +1414,8 @@ else:
             needs_clarification = bool(result.get("needs_clarification", False))
             unanswered_reason = result.get("unanswered_reason")
             follow_up_suggestion = result.get("follow_up_suggestion")
+            reasoning = result.get("reasoning")
+            consistency_note = result.get("consistency_note")
             suggestions = result.get("suggestions") or []
             result_applied_context = (
                 result.get("applied_context", {})
@@ -1561,6 +1570,8 @@ else:
                     "meta": meta,
                     "annotation": annotation_saved,
                     "suggestions": suggestions,
+                    "reasoning": reasoning,
+                    "consistency_note": consistency_note,
                 }
             )
             try:

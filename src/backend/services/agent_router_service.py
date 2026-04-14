@@ -83,6 +83,8 @@ class AgentRouterOutput:
     follow_up_suggestion: str | None = None
     applied_context: dict[str, str] | None = None
     suggestions: list[str] = field(default_factory=list)
+    reasoning: str | None = None
+    consistency_note: str | None = None
 
 
 class AgentRouterService:
@@ -165,7 +167,8 @@ class AgentRouterService:
         # --- Safety check (absolute violations) ---
         safety_result = self.safety_service.check_user_query(translated_query.text)
         if not safety_result.allowed:
-            blocked_message = "I cannot assist with that request due to safety policy."
+            # Use the category-specific refusal message (falls back to generic).
+            blocked_message = safety_result.message or "I cannot assist with that request due to safety policy."
             translated = self.translation_service.translate(blocked_message, source_language="en", target_language=language)
             latency_ms = (time.perf_counter() - started) * 1000
             output = AgentRouterOutput(
@@ -178,7 +181,7 @@ class AgentRouterService:
                 confidence_score=None,
                 cache_status={"embedding_cache_hit": False, "answer_cache_hit": False},
                 labels=["Safety"],
-                takeaways=["Blocked by deterministic safety policy."],
+                takeaways=[f"Blocked by safety policy ({safety_result.category or 'blocked_topic'})."],
                 latency_ms=round(latency_ms, 2),
                 cards=[],
                 sources=[],
@@ -191,14 +194,22 @@ class AgentRouterService:
             self._record_event(
                 request,
                 output,
-                payload={"reason": safety_result.reason, "user_role": normalized_role},
+                payload={
+                    "reason": safety_result.reason,
+                    "category": safety_result.category,
+                    "severity": safety_result.severity,
+                    "user_role": normalized_role,
+                },
                 include_content=True,
             )
+            # For critical-severity blocks (jailbreak etc.) also surface in
+            # unanswered analytics with the specific harm category as reason.
+            unanswered_reason_key = safety_result.category if safety_result.severity == "critical" else "no_cards"
             self.store.record_unanswered(
                 trace_id=trace_id,
                 session_id=request.session_id,
                 user_role=normalized_role,
-                reason="no_cards",
+                reason=unanswered_reason_key,
                 query_text=self.safety_service.redact_pii(request.query),
             )
             return output
@@ -389,7 +400,7 @@ class AgentRouterService:
         response_text = response_payload.answer
         response_safety = self.safety_service.check_assistant_response(response_text)
         if not response_safety.allowed:
-            response_text = "I cannot provide that response due to safety policy."
+            response_text = response_safety.message or "I cannot provide that response due to safety policy."
             route_used = "deterministic"
             fallback_used = True
             fallback_reason = "safety_fallback"
@@ -430,6 +441,8 @@ class AgentRouterService:
             follow_up_suggestion=response_payload.follow_up_suggestion,
             applied_context=applied_context or None,
             suggestions=list(response_payload.suggestions),
+            reasoning=response_payload.reasoning,
+            consistency_note=response_payload.consistency_note,
         )
 
         self.query_cache.set(
@@ -455,6 +468,8 @@ class AgentRouterService:
                 "follow_up_suggestion": output.follow_up_suggestion,
                 "applied_context": output.applied_context or {},
                 "suggestions": output.suggestions,
+                "reasoning": output.reasoning,
+                "consistency_note": output.consistency_note,
             },
         )
 
