@@ -64,3 +64,5 @@ class ChatResponse:
     answer_cache_hit: bool = False
     follow_up_suggestion: str | None = None
     suggestions: list[str] = field(default_factory=list)
+    reasoning: str | None = None
+    consistency_note: str | None = None

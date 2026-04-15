@@ -347,6 +347,8 @@ def post_agent_router(request: AgentRouterRequest, raw_request: Request) -> Agen
         follow_up_suggestion=output.follow_up_suggestion,
         applied_context=output.applied_context,
         suggestions=output.suggestions,
+        reasoning=output.reasoning,
+        consistency_note=output.consistency_note,
     )
 
 
