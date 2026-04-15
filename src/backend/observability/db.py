@@ -186,11 +186,12 @@ class ObservabilityStore:
                 CREATE INDEX IF NOT EXISTS idx_saved_searches_session_id ON saved_searches(session_id);
                 CREATE INDEX IF NOT EXISTS idx_saved_searches_similarity ON saved_searches(similarity_key);
                 CREATE INDEX IF NOT EXISTS idx_saved_searches_pinned ON saved_searches(pinned);
-                CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at);
                 """
             )
             conn.commit()
             # --- migrations for existing databases ---
+            # Run ALTER TABLE first so that any index referencing new columns
+            # (e.g. idx_sessions_last_active) is created AFTER the column exists.
             for _col, _ddl in (
                 ("last_active_at", "ALTER TABLE sessions ADD COLUMN last_active_at TEXT"),
                 ("token_hash",     "ALTER TABLE sessions ADD COLUMN token_hash TEXT"),
@@ -200,6 +201,14 @@ class ObservabilityStore:
                     conn.commit()
                 except sqlite3.OperationalError:
                     pass  # column already exists
+            # Create indexes that depend on migrated columns (safe to re-run).
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at)"
+                )
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
     def record_session_start(
         self, session_id: str, locale: str, consent: bool, token_hash: str = ""
