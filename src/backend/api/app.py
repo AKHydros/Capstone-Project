@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 import hashlib
+import logging
 import os
 import time
 import threading
@@ -11,10 +13,12 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
+
+logger = logging.getLogger(__name__)
 
 from ..config import load_config, resolve_api_role
 from ..services.agent_router_service import AgentRouterInput
@@ -126,7 +130,18 @@ _limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 
 app = FastAPI(title="Capstone Chatbot API", version="1.0.0")
 app.state.limiter = _limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    """Returns 429 with a Retry-After header so clients know when to back off."""
+    return JSONResponse(
+        status_code=429,
+        content={"detail": f"Rate limit exceeded: {exc.detail}. Retry after 60 seconds."},
+        headers={"Retry-After": "60"},
+    )
+
+
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
 # ---------------------------------------------------------------------------
 # CORS — restrict cross-origin requests to known UI origins.
@@ -153,22 +168,64 @@ class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault("X-XSS-Protection", "1; mode=block")
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        response.headers.setdefault("Content-Security-Policy", "default-src 'self'")
         return response
 
 
+class _TimeoutMiddleware(BaseHTTPMiddleware):
+    """Enforces a hard per-request timeout to prevent thread-pool exhaustion.
+
+    Sync FastAPI routes run in a thread pool with no ceiling by default.
+    A stalled LLM call can block a worker thread indefinitely.  This middleware
+    wraps ``call_next`` with ``asyncio.wait_for`` so any route exceeding
+    ``REQUEST_TIMEOUT_SECONDS`` (default 55s, safely below gunicorn's 60s
+    worker kill timeout) receives a 504 with a ``Retry-After`` header.
+    """
+
+    _TIMEOUT_S: float = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "55"))
+
+    async def dispatch(self, request: Request, call_next):
+        try:
+            return await asyncio.wait_for(call_next(request), timeout=self._TIMEOUT_S)
+        except asyncio.TimeoutError:
+            trace_id = getattr(request.state, "trace_id", "unknown")
+            logger.warning("Request timed out after %.0fs path=%s", self._TIMEOUT_S, request.url.path)
+            return JSONResponse(
+                status_code=504,
+                content={"detail": "Request timed out — try a more specific query.", "trace_id": trace_id},
+                headers={"Retry-After": "10"},
+            )
+
+
+app.add_middleware(_TimeoutMiddleware)
 app.add_middleware(_SecurityHeadersMiddleware)
 
 
 @app.on_event("startup")
 def warm_runtime() -> None:
-    """FastAPI startup hook that pre-warms runtime and expires stale sessions (L3)."""
+    """FastAPI startup hook that pre-warms runtime, expires stale sessions, and prunes old records."""
     rt = _runtime()
     expired = rt.observability_store.expire_stale_sessions(idle_hours=24)
     if expired:
-        import logging as _logging
-        _logging.getLogger(__name__).info("Expired %d stale session(s) on startup.", expired)
+        logger.info("Expired %d stale session(s) on startup.", expired)
+    retention_days = int(os.getenv("DB_RETENTION_DAYS", "90"))
+    pruned = rt.observability_store.prune_old_records(days=retention_days)
+    if pruned:
+        logger.info("Pruned %d old observability record(s) (retention=%d days).", pruned, retention_days)
+
+
+@app.on_event("shutdown")
+def shutdown_handler() -> None:
+    """Closes DB connections and flushes pending observability writes on SIGTERM."""
+    try:
+        rt = _runtime()
+        rt.observability_store.close()
+        logger.info("Observability DB connection closed on shutdown.")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @app.middleware("http")
@@ -212,6 +269,21 @@ async def trace_middleware(request: Request, call_next):
     response.headers["x-trace-id"] = trace_id
     response.headers["x-latency-ms"] = str(latency_ms)
     return response
+
+
+@app.get("/health", include_in_schema=False)
+def health_check() -> JSONResponse:
+    """Load-balancer / orchestrator readiness probe. No auth required. Returns 200 OK or 503."""
+    try:
+        rt = _runtime()
+        rt.observability_store._connect()
+        index_ready = rt.retriever is not None
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ok", "index": "ready" if index_ready else "loading"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=503, content={"status": "unavailable", "detail": str(exc)})
 
 
 @app.get("/api/health/llm", response_model=LlmHealthResponse)
@@ -418,20 +490,23 @@ def get_index_health() -> IndexHealthResponse:
 
 
 @app.post("/api/index/rebuild", response_model=ReindexResponse, dependencies=[Depends(_require_roles("admin"))])
-def post_index_rebuild(payload: ReindexRequest) -> ReindexResponse:
+@_limiter.limit("2/minute")
+def post_index_rebuild(payload: ReindexRequest, request: Request) -> ReindexResponse:
     """Triggers forced index rebuild and returns rebuilt index health."""
     runtime = _rebuild_runtime(refresh_prompts=payload.refresh_prompts)
     return ReindexResponse(ok=True, index_health=_index_health_payload(runtime))
 
 
 @app.get("/api/metrics/sla", dependencies=[Depends(_require_roles("admin"))])
-def get_metrics_sla() -> dict[str, float | int]:
+@_limiter.limit("10/minute")
+def get_metrics_sla(request: Request) -> dict[str, float | int]:
     """Returns SLA metrics (latency percentiles, rates, counts)."""
     return _runtime().observability_store.sla_metrics()
 
 
 @app.get("/api/metrics/monthly-snapshots", dependencies=[Depends(_require_roles("admin"))])
-def get_metrics_monthly_snapshots() -> dict[str, object]:
+@_limiter.limit("10/minute")
+def get_metrics_monthly_snapshots(request: Request) -> dict[str, object]:
     """Creates a monthly snapshot and returns snapshots + session rollups."""
     runtime = _runtime()
     runtime.observability_store.create_monthly_snapshot()

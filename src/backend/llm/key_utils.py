@@ -32,13 +32,23 @@ def _normalize_secret(raw: str) -> str:
 
 
 def resolve_openai_api_key() -> str:
-    """Return the first configured OpenAI key from supported env vars."""
+    """Return the first configured OpenAI key from supported env vars.
+
+    Reads ``.env`` on every call so key rotations take effect without a
+    process restart.  ``.env`` values take precedence over the stale
+    process-environment copy that ``load_dotenv()`` (called once at import
+    in ``config.py``) may have baked in at startup.
+    """
     dotenv_values_map = _dotenv_key_values()
     for env_name in OPENAI_KEY_ENV_VARS:
-        value = _normalize_secret(os.getenv(env_name, ""))
+        # Prefer the live .env file value over the stale os.environ snapshot.
+        value = _normalize_secret(dotenv_values_map.get(env_name, ""))
         if not value:
-            value = _normalize_secret(dotenv_values_map.get(env_name, ""))
+            value = _normalize_secret(os.getenv(env_name, ""))
         if value:
+            # Sync os.environ so other callers (e.g. OpenAI SDK) see the
+            # current value without needing a restart.
+            os.environ[env_name] = value
             return value
     return ""
 

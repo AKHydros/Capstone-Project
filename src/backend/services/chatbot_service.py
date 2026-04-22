@@ -667,7 +667,7 @@ class ChatbotService:
         if not conversation_context:
             return ""
         lines: list[str] = []
-        for turn in conversation_context[-20:]:
+        for turn in conversation_context[-6:]:
             role = str(turn.get("role", "")).strip().lower()
             if role not in {"user", "assistant"}:
                 continue

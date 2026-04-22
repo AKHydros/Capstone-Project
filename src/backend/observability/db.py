@@ -186,11 +186,12 @@ class ObservabilityStore:
                 CREATE INDEX IF NOT EXISTS idx_saved_searches_session_id ON saved_searches(session_id);
                 CREATE INDEX IF NOT EXISTS idx_saved_searches_similarity ON saved_searches(similarity_key);
                 CREATE INDEX IF NOT EXISTS idx_saved_searches_pinned ON saved_searches(pinned);
-                CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at);
                 """
             )
             conn.commit()
             # --- migrations for existing databases ---
+            # Run ALTER TABLE first so that any index referencing new columns
+            # (e.g. idx_sessions_last_active) is created AFTER the column exists.
             for _col, _ddl in (
                 ("last_active_at", "ALTER TABLE sessions ADD COLUMN last_active_at TEXT"),
                 ("token_hash",     "ALTER TABLE sessions ADD COLUMN token_hash TEXT"),
@@ -200,6 +201,14 @@ class ObservabilityStore:
                     conn.commit()
                 except sqlite3.OperationalError:
                     pass  # column already exists
+            # Create indexes that depend on migrated columns (safe to re-run).
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at)"
+                )
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
     def record_session_start(
         self, session_id: str, locale: str, consent: bool, token_hash: str = ""
@@ -875,6 +884,39 @@ class ObservabilityStore:
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def prune_old_records(self, days: int = 90) -> int:
+        """Deletes observability records older than *days* to prevent unbounded DB growth.
+
+        Retention is applied to high-volume tables only.  Sessions, governance items,
+        saved searches, and monthly snapshots are intentionally excluded — they are
+        low-volume and have long-term analytical value.
+
+        Parameters
+        ----------
+        days:
+            Records older than this many days are deleted.  Pass 0 to delete
+            everything (useful for testing).
+
+        Returns
+        -------
+        int
+            Total number of rows deleted across all pruned tables.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+        total = 0
+        with self._connect() as conn:
+            for table, col in (
+                ("events", "ts"),
+                ("traces", "created_at"),
+                ("qa_pairs", "created_at"),
+                ("unanswered_queries", "created_at"),
+                ("response_feedback", "created_at"),
+            ):
+                cur = conn.execute(f"DELETE FROM {table} WHERE {col} < ?", (cutoff,))  # noqa: S608
+                total += cur.rowcount
+            conn.commit()
+        return total
 
 
 def _now() -> str:

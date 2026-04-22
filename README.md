@@ -14,7 +14,7 @@ Research-first conversational assistant for PMG data dictionaries with grounded 
 | Auth | `Authorization: Bearer <token>` (standard RFC 6750); legacy `x-internal-token` accepted as fallback |
 | Security | CORS, security headers, rate limiting, PII redaction at DB layer, prompt injection delimiters, Markdown/JS output sanitization, file magic-byte validation, query length cap |
 | Observability | SQLite telemetry, JSONL events, trace IDs, SLA snapshots, session expiry, consent ownership |
-| Test status (Apr 2026) | 23 unit tests passing |
+| Test status (Apr 2026) | 92 tests passing (unit + API integration) |
 
 ---
 
@@ -73,8 +73,8 @@ All items were addressed as part of a structured security audit. Findings by sev
 | ID | Finding | Fix |
 |---|---|---|
 | C1 | Hardcoded `"dev-internal-token"` default in `config.py` | Replaced with `warnings.warn()` + explicit missing-token notice; raises on blank env var in strict mode |
-| C2 | No rate limiting — DoS trivial | `slowapi` `Limiter` added; 30 req/min on `/api/agent-router`, 60 req/min default |
-| C3 | No CORS or security response headers | `CORSMiddleware` (origins from `CORS_ALLOWED_ORIGINS` env var) + `_SecurityHeadersMiddleware` (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `X-XSS-Protection`) |
+| C2 | No rate limiting — DoS trivial | `slowapi` `Limiter` added; 30 req/min on `/api/agent-router`, 60 req/min default; 2/min on `/api/index/rebuild`; 10/min on `/api/metrics/*` |
+| C3 | No CORS or security response headers | `CORSMiddleware` + `_SecurityHeadersMiddleware` (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy: no-referrer`, `X-XSS-Protection`, `Strict-Transport-Security`, `Content-Security-Policy: default-src 'self'`) |
 | C4 | Prompt injection — user input raw-interpolated into LLM prompt | `<user_query>…</user_query>` delimiter tags; system prompt labels content as untrusted |
 
 ### High (all resolved)
@@ -129,6 +129,56 @@ Three retrieval accuracy issues resolved:
 
 ---
 
+## Production Hardening (Apr 2026)
+
+15 items shipped to close the gap between functionally complete and professionally deployable.
+
+### Reliability
+
+| Item | Change |
+|---|---|
+| **OpenAI retry + timeout** | `OpenAI(timeout=30.0, max_retries=3)` on chat client; `timeout=20.0, max_retries=2` on health probe. SDK handles exponential backoff on transient errors and 429s automatically. |
+| **Embedding graceful degradation** | Semantic scoring already wrapped in `try/except` in `hybrid.py`; failure falls back to lexical-only with `fallback_used=True` logged. Confirmed present. |
+| **`/health` readiness probe** | `GET /health` (no auth) returns `{"status":"ok","index":"ready"}` or 503. Required by nginx, ECS, K8s health checks before routing traffic. |
+| **Graceful shutdown** | `@app.on_event("shutdown")` closes DB thread-local connections on SIGTERM, preventing write corruption mid-flight. |
+| **Rate limits on admin endpoints** | `/api/index/rebuild` capped at 2/min (full reindex is expensive). `/api/metrics/sla` and `/api/metrics/monthly-snapshots` capped at 10/min (exfil surface). |
+
+### Observability & Operations
+
+| Item | Change |
+|---|---|
+| **55-second timeout middleware** | `_TimeoutMiddleware` wraps every route with `asyncio.wait_for`. Returns 504 + `Retry-After: 10` before gunicorn's 60 s worker kill fires, preventing silent thread-pool exhaustion. Configurable via `REQUEST_TIMEOUT_SECONDS`. |
+| **DB retention / pruning** | `ObservabilityStore.prune_old_records(days=90)` deletes old rows from `events`, `traces`, `qa_pairs`, `unanswered_queries`, `response_feedback`. Called on startup. Configurable via `DB_RETENTION_DAYS`. |
+| **Structured JSON logging** | `python-json-logger` hooked into gunicorn via `logconfig_dict`. All gunicorn/uvicorn log lines emit newline-delimited JSON — parseable by ELK, CloudWatch, Datadog without extra tooling. Gracefully falls back to plaintext if package absent. |
+| **`Retry-After: 60` on 429s** | Custom `slowapi` handler replaces the default bare 429. API clients and scripts now have an explicit backoff signal. |
+
+### Security Header Hardening
+
+Three additions to `_SecurityHeadersMiddleware`:
+
+| Header | Value | Purpose |
+|---|---|---|
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | Enforces HTTPS for 1 year after first visit |
+| `Content-Security-Policy` | `default-src 'self'` | Blocks XSS from injected LLM Markdown output |
+| `Referrer-Policy` | `no-referrer` *(was `strict-origin-when-cross-origin`)* | Prevents referrer leakage on cross-origin requests |
+
+### UI Polish
+
+| Item | Change |
+|---|---|
+| **Typed error recovery** | Chat exception handler now parses HTTP status: 401/403 → "Session expired", 429 → "Too many requests", 504 → "Timed out + Retry button", 503 → "Service unavailable", generic → shows last trace ID |
+| **First-time onboarding** | When `chat_history` is empty and consent is granted, shows a welcome card with 3 clickable starter prompts instead of a blank chat area |
+| **Auth revocation detection** | If any API call returns 401/403, sets `auth_invalid=True` and renders a persistent "session expired" banner, stopping further render |
+
+### Test Infrastructure
+
+| Item | Change |
+|---|---|
+| **`tests/conftest.py`** | Adds `src/` to `sys.path` so all tests import `backend.*` without an editable install. Provides `tmp_db`, `mock_llm_client`, and `sample_records` shared fixtures. |
+| **`tests/test_api_integration.py`** | 22 new API integration tests: `/health` probe, `/api/health/llm`, auth enforcement (401/403/role), all 6 security headers, method enforcement (405), DB retention, rate-limit handler. |
+
+---
+
 ## Performance Optimizations (Apr 2026)
 
 | Area | Change | Impact |
@@ -174,6 +224,17 @@ Three retrieval accuracy issues resolved:
 | SharePoint connector | ✅ | Admin sidebar panel + `SharePointLoader` backend |
 | Consent gate debounce | ✅ | Consent API called at most once per session |
 | Pinned dependencies | ✅ | All deps `~=` compatible-release pinned in `pyproject.toml` |
+| Typed error recovery | ✅ | Chat error handler shows context-specific messages for 401/429/504/503; retry button on timeout |
+| First-time onboarding | ✅ | Welcome card with 3 clickable starter prompts shown on empty chat (post-consent) |
+| Auth revocation detection | ✅ | 401/403 mid-session sets `auth_invalid` flag; persistent banner + `st.stop()` |
+| OpenAI retry + timeout | ✅ | `timeout=30.0, max_retries=3` on chat client; auto exponential backoff |
+| DB retention pruning | ✅ | `prune_old_records(days=90)` runs on startup; `DB_RETENTION_DAYS` configurable |
+| JSON structured logging | ✅ | `python-json-logger` in gunicorn; all log lines machine-parseable JSON |
+| 55 s request timeout | ✅ | `_TimeoutMiddleware` returns 504 with `Retry-After` before worker kill |
+| Rate limits on admin ops | ✅ | 2/min on rebuild; 10/min on metrics — prevents DoS via expensive ops |
+| HSTS + CSP headers | ✅ | `Strict-Transport-Security` and `Content-Security-Policy` on every response |
+| Readiness probe | ✅ | `GET /health` (no auth) for load balancer / orchestrator health checks |
+| API integration tests | ✅ | 22 endpoint tests via `fastapi.testclient` — auth, headers, retention, probes |
 
 ---
 
@@ -338,8 +399,9 @@ Short queries under 6 characters (greetings, confirmations) bypass domain checki
 ### Security
 - `Authorization: Bearer <token>` (RFC 6750) primary auth; `x-internal-token` legacy fallback
 - CORS restricted to configured origins (`CORS_ALLOWED_ORIGINS`)
-- Security response headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `X-XSS-Protection`)
-- Rate limiting via `slowapi` (30 req/min on agent-router; 60 req/min default)
+- Security response headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy: no-referrer`, `X-XSS-Protection`, `Strict-Transport-Security`, `Content-Security-Policy`)
+- Rate limiting via `slowapi` (30 req/min on agent-router; 60 req/min default; 2/min on rebuild; 10/min on metrics)
+- 55-second per-request timeout middleware returns 504 + `Retry-After` before worker kill
 - Query length cap (`max_length=2000`) via Pydantic `Field`
 - File upload magic-byte verification + 20 MB cap + filename sanitization
 - PII redaction (email/phone) at every DB write via `_redact_pii()`
@@ -379,7 +441,8 @@ Short queries under 6 characters (greetings, confirmations) bypass domain checki
 - Performance: background preload thread, `@st.cache_resource`, survey pre-filter, cache dedup
 - Streamlit chatbot experience with citations panel, confidence/fallback display, role-aware controls, and export menu
 - Bootstrap pipeline for index caching, prompt caching, observability wiring, and question library preload
-- 23 unit tests passing (chatbot routing, hybrid retrieval, RAG behavior, LLM connectivity, conversational utilities)
+- **92 tests passing** — unit (chatbot routing, hybrid retrieval, RAG behavior, LLM connectivity, conversational utilities, safety hardening, reasoning, multi-turn consistency) + API integration (auth, security headers, health probe, DB retention, rate limits)
+- Production hardening: `/health` probe, 55 s timeout middleware, OpenAI retry/timeout, DB retention, JSON structured logging, typed UI error recovery, onboarding empty state, HSTS + CSP headers, admin endpoint rate limits, graceful shutdown
 
 ### In Progress / Next
 

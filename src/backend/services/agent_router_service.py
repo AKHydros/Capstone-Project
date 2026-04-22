@@ -609,7 +609,7 @@ class AgentRouterService:
                 "role": str(turn.get("role", "")).strip().lower(),
                 "content": str(turn.get("content", "")).strip(),
             }
-            for turn in conversation_context[-20:]
+            for turn in conversation_context[-6:]
         ]
         payload = {
             "q": query_en,
