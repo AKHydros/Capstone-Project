@@ -39,3 +39,42 @@ reuse_port = True
 accesslog = "-"
 errorlog = "-"
 loglevel = os.getenv("API_LOG_LEVEL", "info")
+
+# ── Structured JSON logging ───────────────────────────────────────────────────
+# When python-json-logger is installed, all gunicorn log output is emitted as
+# newline-delimited JSON — machine-parseable by ELK, CloudWatch, Datadog, etc.
+# Falls back to plaintext if the package is not available (e.g. dev installs).
+def _json_log_config() -> dict | None:
+    try:
+        from pythonjsonlogger import jsonlogger  # noqa: F401
+        return {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "json": {
+                    "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
+                    "format": "%(asctime)s %(name)s %(levelname)s %(message)s",
+                }
+            },
+            "handlers": {
+                "console": {
+                    "class": "logging.StreamHandler",
+                    "formatter": "json",
+                    "stream": "ext://sys.stdout",
+                }
+            },
+            "root": {"level": loglevel.upper(), "handlers": ["console"]},
+            "loggers": {
+                "gunicorn.error":  {"handlers": ["console"], "propagate": False},
+                "gunicorn.access": {"handlers": ["console"], "propagate": False},
+                "uvicorn":         {"handlers": ["console"], "propagate": False},
+                "uvicorn.access":  {"handlers": ["console"], "propagate": False},
+            },
+        }
+    except ImportError:
+        return None
+
+
+_log_cfg = _json_log_config()
+if _log_cfg is not None:
+    logconfig_dict = _log_cfg

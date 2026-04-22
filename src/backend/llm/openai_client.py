@@ -24,7 +24,7 @@ class OpenAIChatClient:
             return
         if self.client is not None and api_key == self._api_key:
             return
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, timeout=30.0, max_retries=3)
         self._api_key = api_key
 
     @property

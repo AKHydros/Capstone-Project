@@ -66,7 +66,7 @@ class LlmHealthService:
     def _probe(api_key: str, checked_at: str) -> LlmHealthStatus:
         """Makes a single authenticated API call to verify key validity."""
         try:
-            OpenAI(api_key=api_key).models.list()
+            OpenAI(api_key=api_key, timeout=20.0, max_retries=2).models.list()
             return LlmHealthStatus(status="Connected", checked_at=checked_at, error_summary=None)
         except AuthenticationError as exc:
             return LlmHealthStatus(

@@ -885,6 +885,39 @@ class ObservabilityStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def prune_old_records(self, days: int = 90) -> int:
+        """Deletes observability records older than *days* to prevent unbounded DB growth.
+
+        Retention is applied to high-volume tables only.  Sessions, governance items,
+        saved searches, and monthly snapshots are intentionally excluded — they are
+        low-volume and have long-term analytical value.
+
+        Parameters
+        ----------
+        days:
+            Records older than this many days are deleted.  Pass 0 to delete
+            everything (useful for testing).
+
+        Returns
+        -------
+        int
+            Total number of rows deleted across all pruned tables.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+        total = 0
+        with self._connect() as conn:
+            for table, col in (
+                ("events", "ts"),
+                ("traces", "created_at"),
+                ("qa_pairs", "created_at"),
+                ("unanswered_queries", "created_at"),
+                ("response_feedback", "created_at"),
+            ):
+                cur = conn.execute(f"DELETE FROM {table} WHERE {col} < ?", (cutoff,))  # noqa: S608
+                total += cur.rowcount
+            conn.commit()
+        return total
+
 
 def _now() -> str:
     """Returns current UTC ISO timestamp (seconds precision)."""

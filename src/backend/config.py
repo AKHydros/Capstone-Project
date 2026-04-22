@@ -7,7 +7,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 @dataclass(frozen=True)
@@ -116,7 +116,7 @@ def load_config() -> AppConfig:
     default_router_mode = os.getenv("DEFAULT_ROUTER_MODE", "hybrid").strip().lower()
     conversation_memory_turns = max(
         1,
-        _parse_int_env(os.getenv("CONVERSATION_MEMORY_TURNS"), default=20),
+        _parse_int_env(os.getenv("CONVERSATION_MEMORY_TURNS"), default=6),
     )
     openai_chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
     openai_chat_models_raw = os.getenv("OPENAI_CHAT_MODELS", "").strip()

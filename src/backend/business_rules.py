@@ -10,7 +10,7 @@ from .models import QuestionRecord
 class RetrievalRules:
     lexical_weight: float = 0.45
     semantic_weight: float = 0.55
-    top_k: int = 12
+    top_k: int = 20
     min_score_threshold: float = 0.05
 
 

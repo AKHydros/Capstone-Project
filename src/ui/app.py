@@ -104,6 +104,10 @@ def _init_state() -> None:
         st.session_state.batch_lookup_ids = []
     if "batch_lookup_results" not in st.session_state:
         st.session_state.batch_lookup_results = None
+    if "auth_invalid" not in st.session_state:
+        st.session_state.auth_invalid = False
+    if "last_trace_id" not in st.session_state:
+        st.session_state.last_trace_id = ""
 
 
 _UPLOAD_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
@@ -1213,6 +1217,30 @@ else:
                 _ensure_chat_session_enabled(client, enabled=True)
                 st.rerun()
 
+    # ── Auth revocation banner ──────────────────────────────────────────────
+    if st.session_state.get("auth_invalid"):
+        st.error(
+            "Your session credentials are no longer valid. "
+            "Please reload the page with a valid token.",
+            icon="🔒",
+        )
+        st.stop()
+
+    # ── First-time onboarding empty state ───────────────────────────────────
+    if not st.session_state.chat_history and st.session_state.get("consent_granted"):
+        st.markdown("### Welcome to PMG Intelligence")
+        st.markdown("Ask any question about the PMG survey data dictionaries. Try one of these to get started:")
+        _starter_cols = st.columns(3)
+        _onboarding_prompts = [
+            "What questions in PMG22_WAI relate to retirement?",
+            "What are the value labels for PMG18_ROB question 5?",
+            "Which surveys asked about credit unions?",
+        ]
+        for _col, _op in zip(_starter_cols, _onboarding_prompts):
+            if _col.button(_op, use_container_width=True, key=f"onboard_{_op[:20]}"):
+                st.session_state.prefill_prompt = _op
+                st.rerun()
+
     for idx, msg in enumerate(st.session_state.chat_history):
         with st.chat_message(str(msg.get("role", "assistant"))):
             role = str(msg.get("role", "assistant"))
@@ -1385,23 +1413,44 @@ else:
         st.session_state.last_applied_context = dict(applied_context)
 
         try:
-            result = client.agent_router(
-                session_id=st.session_state.session_id,
-                query=prompt,
-                language=st.session_state.language,
-                filters=filters,
-                mode=st.session_state.router_mode,
-                llm_provider=st.session_state.llm_provider,
-                llm_model=st.session_state.llm_model,
-                inference=inference_settings,
-                input_method=st.session_state.input_method.lower(),
-                conversation_context=conversation_context,
-                applied_context=applied_context,
-            )
+            with st.status("Searching records…", expanded=False) as _status:
+                _status.update(label="Searching records…", state="running")
+                result = client.agent_router(
+                    session_id=st.session_state.session_id,
+                    query=prompt,
+                    language=st.session_state.language,
+                    filters=filters,
+                    mode=st.session_state.router_mode,
+                    llm_provider=st.session_state.llm_provider,
+                    llm_model=st.session_state.llm_model,
+                    inference=inference_settings,
+                    input_method=st.session_state.input_method.lower(),
+                    conversation_context=conversation_context,
+                    applied_context=applied_context,
+                )
+                _route = result.get("route_used", "")
+                _label = "Generating answer…" if _route == "llm" else "Building response…"
+                _status.update(label=_label, state="running")
+                _status.update(label="✅ Done", state="complete")
         except Exception as exc:  # noqa: BLE001
-            st.error(f"Agent router failed: {exc}")
+            _err = str(exc)
+            if "401" in _err or "403" in _err:
+                st.session_state.auth_invalid = True
+                st.error("Session expired or access denied. Please refresh the page with a valid token.")
+            elif "429" in _err:
+                st.warning("Too many requests — please wait a moment and try again.")
+            elif "504" in _err or "timeout" in _err.lower() or "timed out" in _err.lower():
+                st.warning("The request timed out. Try a more specific question or shorter query.")
+                if st.button("Retry", key=f"retry_{len(st.session_state.messages)}"):
+                    st.rerun()
+            elif "503" in _err or "unavailable" in _err.lower():
+                st.error("The service is temporarily unavailable. Check the LLM status in the sidebar.")
+            else:
+                _last_trace = st.session_state.get("last_trace_id", "n/a")
+                st.error(f"Something went wrong — please try again. (trace: {_last_trace})")
         else:
             trace_id = result.get("trace_id", "")
+            st.session_state.last_trace_id = trace_id
             route_used = result.get("route_used", "unknown")
             fallback_used = bool(result.get("fallback_used", False))
             latency_ms = result.get("latency_ms", 0.0)
