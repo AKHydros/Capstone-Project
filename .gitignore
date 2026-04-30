@@ -3,10 +3,13 @@
 # ============================================================
 .env
 .env.*
+.env.local
 *.pem
 *.key
 *.p12
 *.pfx
+*.crt
+deploy/nginx/certs/
 
 # ============================================================
 # Claude Code & Codex — local tooling configs (not for repo)

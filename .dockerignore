@@ -1,0 +1,48 @@
+# ── Secrets — never bake into image ──────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ── Local tooling ─────────────────────────────────────────────────────────────
+.claude/
+.codex/
+.venv/
+venv/
+env/
+
+# ── Runtime data — mounted as volumes in production ───────────────────────────
+data/observability.db*
+data/logs/
+data/cache/
+data/*.xlsx
+data/*.xls
+
+# ── Build artefacts ───────────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# ── Test / dev artefacts ──────────────────────────────────────────────────────
+tests/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Docs & presentation ───────────────────────────────────────────────────────
+docs/
+
+# ── OS noise ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*~

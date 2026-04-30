@@ -1,0 +1,38 @@
+# Streamlit UI — lightweight single-stage image
+FROM python:3.11-slim
+
+LABEL org.opencontainers.image.title="PMG Intelligence UI"
+LABEL org.opencontainers.image.description="Streamlit frontend for PMG Intelligence chatbot"
+
+RUN addgroup --system pmg && adduser --system --ingroup pmg pmg
+
+WORKDIR /app
+
+# Install only UI dependencies (no gunicorn, no backend heavy deps)
+RUN pip install --no-cache-dir \
+        "streamlit~=1.55.0" \
+        "httpx~=0.28.0" \
+        "python-dotenv~=1.2.0"
+
+# Copy UI source
+COPY src/ui/ src/ui/
+COPY src/__init__.py src/__init__.py
+
+RUN chown -R pmg:pmg /app
+USER pmg
+
+EXPOSE 8501
+
+# API_BASE_URL must be set at runtime to point at the API container.
+# Example: http://api:8000  (docker compose service name)
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"
+
+CMD ["streamlit", "run", "src/ui/app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true", \
+     "--browser.gatherUsageStats=false"]

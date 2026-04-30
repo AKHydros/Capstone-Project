@@ -218,7 +218,7 @@ pres.subject  = "Capstone Project 2026";
 
   const stats = [
     { num: "30+",  lbl: "Features\nShipped" },
-    { num: "70",   lbl: "Unit Tests\nPassing" },
+    { num: "92",   lbl: "Unit Tests\nPassing" },
     { num: "3",    lbl: "Routing\nModes" },
     { num: "30",   lbl: "Req / Min\nRate Limit" },
     { num: "EN/FR", lbl: "Multilingual\nSupport" },
